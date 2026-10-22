@@ -1,0 +1,266 @@
+{
+  "search_sources": {
+    "type": "template_list",
+    "description": "① 搜图源池（search_sources）",
+    "hint": "按数组顺序依次尝试，失败自动切换下一源，多源命中合并去重。两类源：`视觉联网模型`（A 类，把图片直接交给带联网检索的多模态模型，回答「这是谁/出自哪里」）与 `图搜图引擎`（B 类，SauceNAO / ascii2d / trace.moe，拿图片公网 URL 做反查，返回结构化相似度与来源链接）。auto 策略下**先跑全部 engine 源再跑 vision 源**：图搜图对二次元角色/作品的命中率高且不花钱，视觉联网模型负责补引擎查不到的实景/冷门主体。⚠️ 两个模板的字段不通用，新增时先选模板再填字段。⚠️ engine 源**只吃公网 URL**：必须打开 image_url.enabled（内置只读图床），否则 engine 源会被逐条跳过（attempts 记 skipped / no_public_url），只剩 vision 源在工作。",
+    "default": [],
+    "templates": {
+      "vision": {
+        "name": "视觉联网模型（vision）",
+        "hint": "A 类源：把原图（data URI 内联，不依赖图床）交给一个**具备联网检索能力**的多模态模型，由它回答图中主体的身份与来历。两种形态二选一：①「AstrBot 提供商引用」填 provider_ref，直接复用 AstrBot 里已配好的提供商（含自建反代，如 gemini-web2api / 豆包图片搜索），api_base/api_key/model 自动从该提供商解析；②「自定义端点」填 api_base + model（+ api_key），直连任何 OpenAI 兼容的联网视觉端点。⚠️ provider_ref 非空时**优先走引用形态**，此时 api_base / api_key 会被忽略，填了也不生效——不要用「填一半」的方式混合配置。⚠️ 一定要选**联网**模型：没有联网检索能力的纯视觉模型（只认训练集里的东西）搬进来会静默降质，用户问「这是谁」它只能瞎猜。",
+        "items": {
+          "enabled": {
+            "type": "bool",
+            "description": "启用该源（enabled）",
+            "hint": "false = 该源不参与任何 search_type 的候选（auto/vision 都会跳过它），配置仍然保留，方便临时停用而不丢参数。",
+            "default": true
+          },
+          "id": {
+            "type": "string",
+            "description": "唯一标识（id）",
+            "hint": "用于日志、返回体 source.id 与 merged_from 归属标注；留空自动生成 `vision_<数组下标>`（下标从 0 起）。建议保持默认自动生成，手工改名后旧日志/旧缓存里的 id 会对不上。",
+            "default": ""
+          },
+          "name": {
+            "type": "string",
+            "description": "显示名（name）",
+            "hint": "只影响日志与摘要里的可读名字（如「豆包联网搜索」）；留空取 id。",
+            "default": ""
+          },
+          "provider_ref": {
+            "type": "string",
+            "description": "AstrBot 提供商引用（provider_ref）",
+            "hint": "下拉选择 AstrBot 已配置的提供商 ID（形如 `豆包/doubao`，也可以是自建反代提供商）。⚠️ 该提供商必须**支持视觉输入 + 联网搜索**，插件会把原图内联进请求体（data URI）并要求它联网核实。⚠️ 用于反代时（如 gemini-web2api 转发的 Gemini），模型侧是否真联网取决于反代上游，插件只能按提示词要求它联网、无法强制。填了本项就等同于选定「provider 引用」形态，api_base/api_key 不再生效。",
+            "default": "",
+            "_special": "select_provider"
+          },
+          "api_base": {
+            "type": "string",
+            "description": "自定义端点（api_base）",
+            "hint": "OpenAI 兼容端点基础地址，如 `https://your-proxy.example.com/v1`；带不带 `/chat/completions` 都行（不带时插件自动补全）。仅在 provider_ref 留空时生效，且必须与 model 同时非空，否则该源判为 invalid、运行期直接跳过（attempts 记 skipped / invalid_source）。",
+            "default": ""
+          },
+          "api_key": {
+            "type": "string",
+            "description": "自定义端点密钥（api_key）",
+            "hint": "以 `Authorization: Bearer <key>` 发送。留空则不下发 Authorization 头（本机反代常见）。⚠️ 日志与工具返回**绝不出现明文 key**（只可能显示前 4 位 + `***`）。",
+            "default": ""
+          },
+          "model": {
+            "type": "string",
+            "description": "模型名（model）",
+            "hint": "自定义端点形态**必填**（与 api_base 同时非空才算合法源）；provider 引用形态下本字段留空即用提供商默认模型；填了也会被忽略（以 §4.7 为准），被忽略的源会在启动 WARNING 与 notes `provider_model_ignored:<id>` 中可见——所以留空即可，填错反而容易触发 400 Unknown model。",
+            "default": ""
+          },
+          "web_search": {
+            "type": "bool",
+            "description": "要求该模型联网检索（web_search）",
+            "hint": "true = 在该源的提示词里明确要求「联网检索后回答」，适合本身不带联网、需要外部提示才会联网的模型；false = 该模型自带联网能力（如豆包图片搜索 API），不必额外叮嘱。⚠️ 它只是提示词开关，不能给一个没有联网能力的模型凭空加上联网。",
+            "default": true
+          },
+          "timeout_sec": {
+            "type": "int",
+            "description": "该源超时（秒，0=用全局）",
+            "hint": "0 = 沿用 `search.source_timeout_sec`（默认 30s）。联网检索通常比普通对话慢，一次搜索 30~90s 都正常，超时即换下一源（不计轮数）。改小会更早放弃、更容易看到「全部源失败」。",
+            "default": 0
+          },
+          "max_size_mb": {
+            "type": "int",
+            "description": "该源图片体积上限（MB，0=用全局）",
+            "hint": "0 = 沿用 `search.max_size_mb`。⚠️ 压缩目标**始终按全局值**决定（先按全局压缩再按源上限校验）；若压完仍超过本值，该源被跳过（attempts 记 skipped / image_too_large_for_source），不会为它单独再压一次。",
+            "default": 0
+          },
+          "max_pixels": {
+            "type": "int",
+            "description": "该源图片像素上限（0=用全局）",
+            "hint": "0 = 沿用 `search.max_pixels`。语义同上：全局压缩在前、源上限只做校验，超限即跳过该源。",
+            "default": 0
+          },
+          "extra_headers": {
+            "type": "dict",
+            "description": "附加请求头（extra_headers）",
+            "hint": "自由映射（JSON 对象），用于反代鉴权（如 `{\"api-key\": \"xxx\"}`、`{\"X-Auth\": \"yyy\"}`）或需要特殊头才放行的网关。留空 `{}` 表示不加任何额外头。⚠️ 这里写的值同样不会被日志/返回值回显。⚠️ 类型必须是 `dict` 而非 `object`：面板校验对 `object` 会强制取 `items` 子模式，缺 `items` 会抛 KeyError 导致保存配置失败；`dict` 才是 AstrBot 的自由映射类型，用户自加的键会被当数据保留。",
+            "default": {}
+          }
+        }
+      },
+      "engine": {
+        "name": "图搜图引擎（engine）",
+        "hint": "B 类源：拿图片的**公网 URL** 去图搜图站点反查，返回结构化命中（相似度 + 作品名 + 链接）。⚠️ 必须先在插件配置里打开 `image_url.enabled`（内置只读图床），否则引擎源全部跳过、纯 engine 请求会直接 failed。⚠️ 本环境实测：saucenao.com 与 ascii2d.net 均返回 **403 + Cloudflare「Just a moment...」人机校验页**（插件会识别为 challenge 并切下一源，**不会**从挑战页里抠标题当结果）；trace.moe 网络可达但只认动画帧，传非动画图会返回 `{\"error\": ...}`。想真跑通 SauceNAO/ascii2d，需要自建反代（填 base_url）或给 SauceNAO 配 api_key。",
+        "items": {
+          "enabled": {
+            "type": "bool",
+            "description": "启用该源（enabled）",
+            "hint": "false = 跳过该源（auto/engine 都不候选），配置保留。",
+            "default": true
+          },
+          "id": {
+            "type": "string",
+            "description": "唯一标识（id）",
+            "hint": "用于日志与返回体 source.id / attempts.id；留空自动生成 `engine_<数组下标>`。",
+            "default": ""
+          },
+          "name": {
+            "type": "string",
+            "description": "显示名（name）",
+            "hint": "留空取引擎默认名：saucenao→`SauceNAO`、ascii2d→`ascii2d`、trace_moe→`trace.moe`。",
+            "default": ""
+          },
+          "engine": {
+            "type": "string",
+            "description": "引擎（engine，必填）",
+            "hint": "三选一：`saucenao` = 综合动漫/插画/同人图，命中率最高，需公网可访问且常被 Cloudflare 拦（建议配 api_key 或自建反代）；`ascii2d` = 日系插画/画师推特出处（色合检索 + 特征检索），无相似度数值，同样受 Cloudflare 拦截；`trace_moe` = 动画截图专用，返回作品名 + 第几集 + 时间点，**只认动画截图**（真人照片/插画会返回 error，不是 miss）。留空或填其他值 → 该源 invalid，运行期跳过并告警。",
+            "default": "",
+            "options": [
+              "saucenao",
+              "ascii2d",
+              "trace_moe"
+            ]
+          },
+          "api_key": {
+            "type": "string",
+            "description": "引擎密钥（api_key，仅 SauceNAO）",
+            "hint": "只有 SauceNAO 用得上（作为查询参数 `api_key` 下发），ascii2d / trace.moe 会忽略本项。⚠️ SauceNAO 免费额度限速很严（易 429/403），填 API key 可显著降低被 Cloudflare 拦截的概率。",
+            "default": ""
+          },
+          "base_url": {
+            "type": "string",
+            "description": "自定义端点（base_url，自建反代）",
+            "hint": "留空用内置默认端点（saucenao.com / ascii2d.net / api.trace.moe）。被 Cloudflare 拦时，把这里指向自建反代即可绕过：saucenao 替换 host 与 path（保留三个查询参数）、ascii2d 替换为 `{base_url}/search/uri`、trace_moe 替换为 `{base_url}/search`。⚠️ 反代必须保留原站接口语义，否则会变成「解析失败」而不是 challenge。",
+            "default": ""
+          },
+          "timeout_sec": {
+            "type": "int",
+            "description": "该源超时（秒，0=用全局）",
+            "hint": "0 = 沿用 `search.source_timeout_sec`（默认 30s）。图搜图站点偶尔要等几十秒出结果，超时只换源、不计轮数。",
+            "default": 0
+          },
+          "extra_headers": {
+            "type": "dict",
+            "description": "附加请求头（extra_headers）",
+            "hint": "自由映射（JSON 对象），自建反代需要额外鉴权头时使用（如 `{\"X-Auth\": \"yyy\"}`）；默认 `{}`。⚠️ 类型必须是 `dict` 而非 `object`：面板校验对 `object` 会强制取 `items` 子模式，缺 `items` 会抛 KeyError 导致保存配置失败；`dict` 才是 AstrBot 的自由映射类型。",
+            "default": {}
+          }
+        }
+      }
+    }
+  },
+  "search": {
+    "type": "object",
+    "description": "② 检索通用参数（search）",
+    "hint": "控制「跑几个源、跑多久、要不要合并、要不要缓存」以及图片体积/像素的全局上限。逐源字段（timeout_sec / max_size_mb / max_pixels）只能比这里的值更严，不会更宽。",
+    "default": {},
+    "items": {
+      "max_rounds": {
+        "type": "int",
+        "description": "每图轮数上限（max_rounds）",
+        "hint": "范围 0~10，默认 2。**只有「明确未命中（miss）」才计轮数**：源报错、超时、被 Cloudflare 挑战、因尺寸/缺 URL 被跳过，**一律不计轮、不停止**，继续按顺序换下一源。所以网络很差时也不会因为报错就用光轮数。0 = 第一个 miss 就停（最省额度，但会漏掉后续源的命中）。⚠️ 这里**没有**「结果质量不满意就换一个模型重试」的语义——v2.0 已彻底删除该机制。",
+        "default": 2
+      },
+      "source_timeout_sec": {
+        "type": "int",
+        "description": "单源默认超时（秒）",
+        "hint": "范围 5~300，默认 30。被源自身的 timeout_sec 覆盖。超时只影响该源（单源隔离），不污染同一次调用里的其他源与其他图。",
+        "default": 30
+      },
+      "total_timeout_sec": {
+        "type": "int",
+        "description": "单次调用总预算（秒）",
+        "hint": "范围 30~900，默认 180。整张图（含换源与合并）共用这个预算；用完后停止尝试剩余源，**已拿到的命中照常返回**，并在返回体 notes 里追加 `total_timeout`。多源池 + 慢网络时建议抬高，否则会出现「明明有源可用却只剩一半结果」。",
+        "default": 180
+      },
+      "merge_enabled": {
+        "type": "bool",
+        "description": "多源命中合并（merge_enabled）",
+        "hint": "true = 某个源命中后继续尝试后续源，把它们的命中合并去重（引擎给出处、视觉模型给身份描述，互相补全）；false = 首个命中立即停止（最省时间与额度，但结果信息量最少）。",
+        "default": true
+      },
+      "merge_max_sources": {
+        "type": "int",
+        "description": "每图最多合并源数（merge_max_sources）",
+        "hint": "范围 1~5，默认 3（含首个命中源）。达到即停止继续尝试。⚠️ 代价是真实调用：每个被尝试的 vision 源都会产生一次（可能收费的）模型请求，engine 源也会消耗图搜图额度，调大要心里有数。",
+        "default": 3
+      },
+      "cache_ttl_sec": {
+        "type": "int",
+        "description": "结果缓存 TTL（秒，0=关闭）",
+        "hint": "范围 0~3600，默认 300。缓存键 = `sha256(图片字节) + search_type + question`；命中缓存直接返回（`cached=true`）且**零网络请求**。0 = 关闭缓存。⚠️ 缓存写入图片字节哈希，同一张图换个问法（question 不同）不会命中。",
+        "default": 300
+      },
+      "health_stats": {
+        "type": "bool",
+        "description": "源健康统计（health_stats）",
+        "hint": "true = 累计各源的尝试/命中/未命中/报错/挑战次数与平均耗时，在插件卸载（terminate）时输出一行英文摘要。⚠️ 统计**只用于日志排障，不会改变源顺序**——不存在「失败的源自动降级排后面」这种暗箱行为。",
+        "default": true
+      },
+      "max_size_mb": {
+        "type": "int",
+        "description": "图片体积上限（MB）",
+        "hint": "范围 1~100，默认 20。超过先等比缩放并重编码为 JPEG（quality 85）；压完仍超 → 该图 ok=false、error=`image_too_large`，不影响其他图。⚠️ 这是**全局压缩目标**，逐源上限只做校验不做二次压缩。",
+        "default": 20
+      },
+      "max_pixels": {
+        "type": "int",
+        "description": "图片像素上限（宽×高）",
+        "hint": "范围 1048576~67108864，默认 16777216（约 4096×4096）。超过则等比缩放（最长边 ≤ 4096）。手机原图常有 4000×3000 以上，调太小会牺牲细节、影响小字/远景主体的识别质量。",
+        "default": 16777216
+      }
+    }
+  },
+  "image_url": {
+    "type": "object",
+    "description": "③ 内置只读图床（image_url）",
+    "hint": "插件自带的只读 HTTP 图床，**只服务于图搜图引擎**（SauceNAO / ascii2d / trace.moe 只能接公网 URL，不能接 base64）。视觉联网模型一律用 data URI 内联图片，不受本开关影响。默认关闭，不改变现有部署行为。",
+    "default": {},
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用内置图床（enabled）",
+        "hint": "true = 插件加载时启动图床，把待搜图片落到本地目录并生成公网可访问 URL，engine 源才有的可查；false = engine 源全部被跳过（attempts 记 skipped / no_public_url），只留 vision 源工作。⚠️ 必须保证听得到公网地址（云主机安全组/防火墙放行端口、或对外已有反代），否则 SauceNAO 那边拉不到图，会得到「Failed to fetch image」类错误。",
+        "default": false
+      },
+      "dir": {
+        "type": "string",
+        "description": "图片落盘目录（dir）",
+        "hint": "留空则运行时解析为 `{AstrBot data}/plugin_data/astrbot_plugin_image_search/imgserv`（推荐留空）。目录不存在自动创建；不可写则告警并降级为「url 传输不可用」（engine 源整体跳过）。⚠️ 从 v1.7 迁移过来的用户此项可能还指向旧插件目录，迁移脚本会原样保留——换插件后建议在 WebUI 里清空本项，改用新插件的默认目录。",
+        "default": ""
+      },
+      "port": {
+        "type": "int",
+        "description": "监听端口（port）",
+        "hint": "范围 1~65535，默认 8123。被占用时自动 +1 重试（最多 10 次），成功后日志记录实际 bound_port —— 所以配置写 8123 不代表一定监听在 8123，对外暴露前请看启动日志确认。",
+        "default": 8123
+      },
+      "public_base_url": {
+        "type": "string",
+        "description": "对外访问前缀（public_base_url）",
+        "hint": "拼给图搜图站点访问的 URL 前缀，如 `https://img.example.com`。留空则用 `http://<自动探测公网 IP>:<实际端口>`。末尾斜杠会自动去掉。⚠️ 云主机上自动探测经常拿到内网 IP，导致图搜图站点抓不到图——生产使用建议**显式填写**（域名反代或公网 IP:端口）。",
+        "default": ""
+      }
+    }
+  },
+  "download_timeout_sec": {
+    "type": "int",
+    "description": "远程图片下载超时（秒）",
+    "hint": "范围 5~120，默认 20。只作用于引用本身是 `http(s)` 链接的图片；本地路径 / data URI / base64 不涉及下载。下载超时、非 200、或内容不是图片（魔数嗅探失败）→ 该图 ok=false、error=`download_failed`，不影响其他图。⚠️ 内网/环回/保留网段地址会被 SSRF 防护直接拒绝（error=`ssrf_blocked`），这是刻意行为，不是 bug。",
+    "default": 20
+  },
+  "tool_hint_enabled": {
+    "type": "bool",
+    "description": "注入图片路径与工具提示（tool_hint_enabled）",
+    "hint": "true = 每次 LLM 请求前，把消息里没在正文出现过的图片引用补成 `[Image Attachment: path <路径>]` 追加进上下文，并附带一行 `image_search` 工具提示（带 `[image-search-hint]` 标记，幂等去重、不会重复堆叠）。这是主模型知道「有图可以搜、图在哪」的关键；关掉后主模型只能靠自身多模态能力看图，**搜图工具基本不会被触发**。注入异常不会阻断正常对话。",
+    "default": true
+  },
+  "log_level": {
+    "type": "string",
+    "description": "插件日志级别（log_level）",
+    "hint": "`debug` 会打印逐源尝试明细（含被跳过的源与原因，排障首选）、`info` 只打关键节点、`warning` 只看异常、`error` 最安静。枚举外的值回落 `info` 并告警。日志一律英文（仓库规范）。⚠️ 日志与工具返回都不会输出明文 API Key。",
+    "default": "info",
+    "options": [
+      "debug",
+      "info",
+      "warning",
+      "error"
+    ]
+  }
+}
