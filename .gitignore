@@ -1,0 +1,11 @@
+# Python 缓存与测试产物
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# AstrBot 运行时产物（含用户配置与凭据形状，禁止入库）
+data/
+
+# 本地环境
+.venv/
+*.log

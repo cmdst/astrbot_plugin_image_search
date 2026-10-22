@@ -4,5 +4,5 @@ desc: "纯搜图插件（v2.0.0 破坏性重构）。唯一 LLM 工具 image_sea
 short_desc: "纯搜图工具 image_search：主模型传图，插件按可配置源池路由（A 类视觉联网模型 provider 引用/自定义端点 + B 类图搜图引擎 SauceNAO/ascii2d/trace.moe），失败自动换源、多源命中合并去重，返回结构化 JSON 供主模型改写回复"
 version: 2.0.0
 author: dev
-repo: ""
+repo: "https://github.com/cmdst/astrbot_plugin_image_search"
 astrbot_version: ">=4.16,<5"
