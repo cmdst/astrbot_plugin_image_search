@@ -1,8 +1,8 @@
 name: astrbot_plugin_image_search
 display_name: 搜图路由 Agent
-desc: "纯搜图插件（v2.0.0 破坏性重构）。唯一 LLM 工具 image_search(image_refs[], question, search_type)，主模型遇「图中主体是谁 / 出自哪里 / 什么梗」时传图，插件路由到可配置搜图源池并联网检索，结果以结构化 JSON + 可读摘要回传主模型，由主模型组织回复（插件自己不发送任何消息）。源池两类：①A 类视觉联网模型 vision——AstrBot 提供商引用（provider_ref，含 gemini-web2api 等自建反代）或自定义 OpenAI 兼容端点（api_base + api_key + model），图片以 data URI 内联，不依赖图床；②B 类图搜图引擎 engine——SauceNAO / ascii2d / trace.moe，只接图片公网 URL（需开启内置只读图床 image_url.enabled）。search_type=auto 先跑全部 engine 再跑 vision（图搜图对二次元角色/作品命中率高且不花钱，视觉联网模型补引擎查不到的实景与冷门主体）。逐源失败自动切换下一源并单源超时隔离（error / timeout / challenge / skipped 均不计轮数），只有「明确未命中 miss」计轮，受 search.max_rounds 约束（默认 2）；命中后按 merge_enabled / merge_max_sources 继续尝试后续源做多源合并去重（merged_from 逐源标注归属）。图片流水线：引用归一化（本地路径 / file:// / http(s) / data URI / base64:// / [Image Attachment: path ...]）→ SSRF 防护（拒绝内网、环回、链路本地、保留段，重定向后二次校验）→ 体积/像素校验与等比压缩 → data URI 或图床 URL → 逐源尝试 → 结构化返回（tool/ok/status/search_type/images[]/summary/hint/elapsed_ms/cached/notes）。返回体逐图给出 ok/transport/source/match/answer/merged_from/attempts（含被跳过的源与原因）/rounds_used/error，必不抛异常给主模型、必不含 API Key。Cloudflare 挑战页有独立识别与 branch（不解析挑战页、不产生结果），纯 engine 池在未开图床时明确 skipped 而非静默失败。配置热更新；v1.7 → v2.0 配置迁移脚本 migrate_v1_7.py（旧 route.llm_provider → 一条 vision 源；旧 ais 识图池整节丢弃并快照进迁移报告）。analyze 识图池（ais 多 AI 池、关键词预路由、质量不满意换 AI、兜底直判）已在 v2.0 彻底移除，看图/转述/OCR 一律交主模型自身多模态能力。"
-short_desc: "纯搜图工具 image_search：主模型传图，插件按可配置源池路由（A 类视觉联网模型 provider 引用/自定义端点 + B 类图搜图引擎 SauceNAO/ascii2d/trace.moe），失败自动换源、多源命中合并去重，返回结构化 JSON 供主模型改写回复"
-version: 2.0.0
+desc: "纯搜图插件 v2.1.0：唯一 LLM 工具 image_search(image_refs, question, intent, search_type)。主模型把图片与可选的检索线索（intent：怀疑的角色 / 作品 / 场景）交给插件，插件按可配置源池路由：A 类视觉联网模型（AstrBot provider 引用或自定义 OpenAI 兼容端点）与 B 类图搜图引擎（SauceNAO / ascii2d / trace.moe，需开启内置只读图床）。逐源失败自动换源、单源超时隔离、多源命中合并去重；返回结构化 JSON + 可读摘要，不发送消息、不抛异常、不含 API Key。"
+short_desc: "纯搜图工具 image_search：可用 intent 提供角色/作品/场景线索，源池可配 vision/engine，失败换源、多源合并，返回结构化 JSON"
+version: 2.1.0
 author: dev
 repo: "https://github.com/cmdst/astrbot_plugin_image_search"
 astrbot_version: ">=4.16,<5"

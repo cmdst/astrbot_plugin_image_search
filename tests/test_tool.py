@@ -1,7 +1,7 @@
 """test_tool.py -- image_search 工具契约单测（PRD §1.1~§1.6 / §3.1 / §4.7 / §5）。
 
 覆盖点：
-- 工具 docstring 可被 `docstring_parser` 解析出三个参数名与类型注释（否则
+- 工具 docstring 可被 `docstring_parser` 解析出四个参数名与类型注释（否则
   `register_llm_tool` 会抛「参数缺少类型注释」）；AstrBot 工具注册表里只有
   `image_search` 一个本插件工具，名字不含 analyze 语义；
 - 空源池 → 友好引导 JSON（指向插件配置 search_sources），不抛异常；
@@ -21,7 +21,6 @@ import json
 import re
 
 import docstring_parser
-import pytest
 from conftest import (
     FakeContext,
     FakeHttpxResponse,
@@ -44,13 +43,14 @@ HIT_ANSWER = "VERDICT: HIT\n主体：初音未来\n出处：VOCALOID / Crypton F
 
 
 class TestToolDocstring:
-    def test_docstring_parses_three_typed_params(self):
+    def test_docstring_parses_four_typed_params(self):
         func = plugin_main.ImageSearchPlugin.image_search
         parsed = docstring_parser.parse(func.__doc__ or "")
         params = {param.arg_name: param.type_name for param in parsed.params}
         assert params == {
             "image_refs": "list[string]",
             "question": "string",
+            "intent": "string",
             "search_type": "string",
         }
         assert parsed.description
@@ -73,18 +73,20 @@ class TestToolDocstring:
         schema = tool.parameters
         assert schema["type"] == "object"
         properties = schema["properties"]
-        # 恰好三个参数：AstrBot 注入的 event 不得出现在工具 schema 里
-        assert set(properties) == {"image_refs", "question", "search_type"}
+        # 恰好四个参数：AstrBot 注入的 event 不得出现在工具 schema 里
+        assert set(properties) == {"image_refs", "question", "intent", "search_type"}
         assert "event" not in properties
         assert properties["image_refs"]["type"] == "array"
         assert properties["image_refs"]["items"] == {"type": "string"}
         assert properties["question"]["type"] == "string"
+        assert properties["intent"]["type"] == "string"
         assert properties["search_type"]["type"] == "string"
         assert "analyze" not in tool.name
 
     def test_tool_signature_defaults(self):
         signature = inspect.signature(plugin_main.ImageSearchPlugin.image_search)
         assert signature.parameters["question"].default == ""
+        assert signature.parameters["intent"].default == ""
         assert signature.parameters["search_type"].default == "auto"
         assert signature.parameters["image_refs"].default is None
 
@@ -583,6 +585,32 @@ class TestInternalSafety:
 
 
 class TestImageUrlIntegration:
+    def test_vision_only_pool_does_not_publish_to_image_server(
+        self, make_plugin, monkeypatch, tiny_png_bytes
+    ):
+        """仅 vision 候选时不应调用图床发布（v2.1.0：避免无用落盘）。"""
+        calls: list[int] = []
+
+        def fake_publish(self, data, ext):
+            calls.append(1)
+            return "http://example.invalid/x.png"
+
+        async def fake_call(endpoint, **kwargs):
+            return HIT_ANSWER
+
+        monkeypatch.setattr(
+            plugin_main.ImageSearchPlugin, "_publish_image", fake_publish
+        )
+        monkeypatch.setattr(
+            plugin_main.provider_reader, "call_vision_source", fake_call
+        )
+        plugin = asyncio.run(make_plugin(config_with_sources(custom_vision_source())))
+        payload = _call(
+            plugin, image_refs=[to_data_uri(tiny_png_bytes, "png")], search_type="vision"
+        )
+        assert payload["status"] == "ok"
+        assert calls == []
+
     def test_image_url_enabled_publishes_and_terminate_stops_server(
         self, make_plugin, monkeypatch, tiny_png_bytes, tmp_path
     ):
@@ -758,7 +786,7 @@ class TestRepairRound2Secrets:
             line for line in caplog.text.splitlines() if "failed" in line
         )
         assert key not in masked_line
-        assert f"HTTP 500: upstream died with sk-r***" == attempt_error
+        assert "HTTP 500: upstream died with sk-r***" == attempt_error
         assert "sk-r***" in masked_line
 
 

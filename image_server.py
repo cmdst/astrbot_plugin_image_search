@@ -1,4 +1,4 @@
-r"""image_server.py -- 插件内置只读 HTTP 图床服务（v2.0.0，只读，零第三方依赖）。
+r"""image_server.py -- 插件内置只读 HTTP 图床服务（v2.1.0，只读，零第三方依赖）。
 
 用途（PRD §2.6）：**仅 B 类 engine 源需要公网图片 URL**（SauceNAO / ascii2d /
 trace.moe 都只接受 URL）；vision 源一律走 data URI，不依赖本服务。因此本服务

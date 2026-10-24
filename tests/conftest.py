@@ -1,4 +1,4 @@
-"""conftest.py -- 搜图路由 Agent v2.0.0 插件单测公共夹具。
+"""conftest.py -- 搜图路由 Agent v2.1.0 插件单测公共夹具。
 
 导入方式沿用旧插件约定：插件目录是 AstrBot namespace package（无 `__init__.py`，
 运行时以 `data.plugins.<plugin_dir>` 导入），测试把 `data/plugins` 加入 `sys.path`，

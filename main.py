@@ -1,23 +1,27 @@
-"""main.py -- 搜图路由 Agent 插件（astrbot_plugin_image_search）v2.0.0。
+"""main.py -- 搜图路由 Agent 插件（astrbot_plugin_image_search）v2.1.0。
 
 **唯一 LLM 工具 `image_search`**：主模型遇到「图中角色/场景是谁、出自哪里」类问题时，
 把消息里的图片引用传给本工具，插件按配置的**搜图源池**顺序联网检索，失败自动换下一个
 源，多源命中合并去重，最后把结构化 JSON（+ 可读摘要）回传主模型，由主模型组织回复。
 
-- **A 类 vision 源**（PRD §4.7）：AstrBot 提供商引用（可为反代提供商）或自定义
+v2.1.0 的工具多一个可选参数 `intent`：主模型可以把「怀疑是谁 / 哪部作品 / 什么场景」
+这类检索线索交给搜图模型，用来缩小检索范围；它只进入 vision 提示词与缓存键，
+不改变 engine 源的请求形态。
+
+- **A 类 vision 源**（PRD §2.2）：AstrBot 提供商引用（可为反代提供商）或自定义
   OpenAI 兼容端点；图片一律以 data URI 交给模型，提示词要求「先看图 → 联网检索 →
   给出识别结论 / 出处作品 / 佐证来源 / 不确定项」（`prompts.py`）。
-- **B 类 engine 源**（PRD §4.1）：SauceNAO / ascii2d / trace.moe，只接受**公网图片
+- **B 类 engine 源**（PRD §4）：SauceNAO / ascii2d / trace.moe，只接受**公网图片
   URL**（图床 `image_url.enabled=false` 时全部记 `skipped(no_public_url)`，
   `search_type=auto` 下仍由 vision 源兜住）。
 - **逐图独立 + 超时隔离**：每张图 `asyncio.wait_for` 独立预算，单图异常/超时只影响
-  该图；每个源同样独立 `wait_for`（PRD §3.1），失败/超时/挑战页**不计轮数**、
-  只有明确 `miss` 计轮（PRD §3.2 `search.max_rounds`）。
+  该图；每个源同样独立 `wait_for`（PRD §3），失败/超时/挑战页**不计轮数**、
+  只有明确 `miss` 计轮（PRD §2.4 `search.max_rounds`）。
 - **彻底删除 analyze 识图池**（PRD §0 边界①）：本插件不注册任何识图/转述工具，
   无 ais 多 AI 池、无关键词预路由、无「质量不满意换 AI」、无兜底直判；`image_search`
   是本插件唯一的工具入口。
 
-配置见 PRD §2（`_conf_schema.json`）；迁移见 §6（`migrate_v1_7.py`）。
+配置见 PRD §2（`_conf_schema.json`）。
 """
 
 from __future__ import annotations
@@ -41,8 +45,10 @@ _TOOL_HINT_TEXT = (
     "（联网搜图提示：若用户问的是图中**主体的身份、出处、来历**——「这是谁」"
     "「这是哪个角色」「出自哪部作品」「什么梗」「背景是哪里」「帮我搜一下这张图」——"
     "请调用工具 image_search(image_refs=[<图片路径1>, <图片路径2>, ...], "
-    'question=<用户原话>, search_type="auto")。image_refs 直接传上面的 '
-    "[Image Attachment: path ...] 路径，支持单图或多图；"
+    'question=<用户原话>, intent=<可选检索线索>, search_type="auto")。image_refs 直接传'
+    "上面的 [Image Attachment: path ...] 路径，支持单图或多图；"
+    "intent 用一两句话告诉搜图模型你怀疑的主体/作品/场景（例如「看起来像《明日方舟》的"
+    "阿米娅」「场景疑似在杭州」），能明显缩小检索范围；不确定就留空。"
     "插件会按配置的搜图源池联网检索并把结果返回给你，你据此用自然语言回答用户。"
     "若只是要求识别/转述图中文字、描述画面、提取表格数据，**不要**调用本工具，"
     "直接用你自己的多模态能力回答。[image-search-hint]"
@@ -50,7 +56,7 @@ _TOOL_HINT_TEXT = (
 
 _TOOL_HINT_MARKER = "[image-search-hint]"
 
-# 单源外层硬闸宽限（PRD §3.1：`asyncio.wait_for(..., timeout=src.timeout + 5)`）
+# 单源外层硬闸宽限（PRD §3：`asyncio.wait_for(..., timeout=src.timeout + 5)`）
 _PER_SOURCE_GRACE_SEC = 5.0
 
 # 挑战页告警节流（PRD §5：每源每运行期最多 3 条，避免刷屏）
@@ -74,7 +80,7 @@ class ImageSearchPlugin(Star):
     # ------------------------------------------------------------ 生命周期
 
     async def initialize(self) -> None:
-        """激活：配置归一化 → 可选启动内置只读图床 → 一行激活日志（PRD §2.8）。
+        """激活：配置归一化 → 可选启动内置只读图床 → 一行激活日志（PRD §2.6）。
 
         配置非法值由 `search_core.normalize_config()` 回落默认值并告警，不阻断加载。
         """
@@ -120,27 +126,21 @@ class ImageSearchPlugin(Star):
                 "image_url.enabled=false: engine sources will be skipped (no_public_url)"
             )
 
-        if search_core.detect_migration_hint():
-            LOG.warning(
-                "legacy v1.7 config found but v2.0 config missing; "
-                "run migrate_v1_7.py to migrate search sources (PRD section 6)"
-            )
-
         enabled = search_core.enabled_sources(cfg)
         vision_ids = [s["id"] for s in enabled if s["kind"] == "vision"]
         engine_ids = [s["id"] for s in enabled if s["kind"] == "engine"]
-        # provider 形态忽略手填 model 的可见性（PRD §4.7 优先；§2.2 措辞待 amend）
+        # provider 形态忽略手填 model 的可见性（PRD §2.2 优先）
         for source in enabled:
             if source.get("model_ignored"):
                 LOG.warning(
                     "source %s uses provider reference %s: hand-written model %r is "
-                    "ignored, the provider default model is used (PRD section 4.7)",
+                    "ignored, the provider default model is used (PRD section 2.2)",
                     source["id"],
                     source.get("provider_ref"),
                     source["model_ignored"],
                 )
         LOG.info(
-            "image_search v2.0.0 activated: vision_sources=%s engine_sources=%s "
+            "image_search v2.1.0 activated: vision_sources=%s engine_sources=%s "
             "search_type_default=auto max_rounds=%s image_url=%s",
             vision_ids,
             engine_ids,
@@ -149,7 +149,7 @@ class ImageSearchPlugin(Star):
         )
 
     async def terminate(self) -> None:
-        """禁用/重载：停止内置图床 + 输出一行源健康统计（PRD §3.5）。"""
+        """禁用/重载：停止内置图床 + 输出一行源健康统计（PRD §3.2）。"""
         server = self._image_server
         self._image_server = None
         if server is not None:
@@ -190,6 +190,7 @@ class ImageSearchPlugin(Star):
         event: AstrMessageEvent,
         image_refs: list[str] | None = None,
         question: str = "",
+        intent: str = "",
         search_type: str = "auto",
     ) -> str:
         """联网搜图：识别图中主体的身份与来历（这是谁 / 出自哪里 / 什么梗 / 哪个角色 / 帮我搜一下）。
@@ -202,13 +203,17 @@ class ImageSearchPlugin(Star):
             image_refs (list[string]): 待搜索的图片引用列表，单图或多图。直接使用消息里给出的
                 图片路径/URL（如 /root/AstrBot/data/temp/xxx.jpg 或 [Image Attachment: path ...]）。
             question (string): 用户关于这些图片的原话，例如「这是谁」「出自哪里」。没有就留空。
+            intent (string): 可选。你根据上下文给出的检索线索，例如「看起来像《明日方舟》的阿米娅」
+                「场景疑似在杭州」「可能是某部国产动画」；用于帮搜图模型缩小范围。不确定就留空。
             search_type (string): 可选。auto（默认，先图搜图引擎再视觉联网模型）/ engine（只用图搜图
                 引擎）/ vision（只用视觉联网模型）。一般不需要指定，保持 auto。
         """
         started = time.time()
         try:
-            return await self._run_search(image_refs, question, search_type, started)
-        except Exception as exc:  # noqa: BLE001 -- 工具不得把异常抛给主模型（PRD §1.6.2）
+            return await self._run_search(
+                image_refs, question, intent, search_type, started
+            )
+        except Exception as exc:  # noqa: BLE001 -- 工具不得把异常抛给主模型（PRD §1.4）
             LOG.error(
                 "image_search internal error: %s\n%s", exc, traceback.format_exc()
             )
@@ -216,19 +221,21 @@ class ImageSearchPlugin(Star):
                 "failed",
                 search_core.INTERNAL_ERROR_SUMMARY,
                 hint=f"内部错误类型：{type(exc).__name__}",
+                intent=search_core.normalize_intent(intent, []),
                 elapsed_ms=self._elapsed_ms(started),
             )
 
     # ------------------------------------------------------------ 执行链路
 
     async def _run_search(
-        self, image_refs, question, search_type, started: float
+        self, image_refs, question, intent, search_type, started: float
     ) -> str:
-        """工具主链路（PRD §3.1）：归一化 → 候选源 → 逐图独立处理 → 结构化 JSON。"""
+        """工具主链路：归一化 → 候选源 → 逐图独立处理 → 结构化 JSON。"""
         cfg = self._active_cfg()
         notes: list[str] = []
         effective_type = search_core.normalize_search_type(search_type, notes)
         clean_question = search_core.normalize_question(question, notes)
+        clean_intent = search_core.normalize_intent(intent, notes)
         refs = search_core.normalize_refs(image_refs, notes)
         if not refs:
             LOG.info("image_search called without usable image_refs")
@@ -238,6 +245,7 @@ class ImageSearchPlugin(Star):
                 search_core.NO_REFS_HINT,
                 search_type=effective_type,
                 question=clean_question,
+                intent=clean_intent,
                 notes=notes,
                 elapsed_ms=self._elapsed_ms(started),
             )
@@ -258,6 +266,7 @@ class ImageSearchPlugin(Star):
                 search_core.EMPTY_POOL_HINT,
                 search_type=effective_type,
                 question=clean_question,
+                intent=clean_intent,
                 notes=notes,
                 elapsed_ms=self._elapsed_ms(started),
             )
@@ -276,6 +285,7 @@ class ImageSearchPlugin(Star):
                         index,
                         ref,
                         clean_question,
+                        clean_intent,
                         effective_type,
                         candidates,
                         deadline,
@@ -309,6 +319,7 @@ class ImageSearchPlugin(Star):
             status=status,
             search_type=effective_type,
             question=clean_question,
+            intent=clean_intent,
             summary=search_core.render_summary(results),
             hint=search_core.render_hint(results, status, effective_type),
             elapsed_ms=self._elapsed_ms(started),
@@ -328,12 +339,13 @@ class ImageSearchPlugin(Star):
         index: int,
         ref,
         question: str,
+        intent: str,
         search_type: str,
         candidates: list[dict],
         deadline: float,
         notes: list[str],
     ) -> dict:
-        """单图流水线（PRD §3.1 步骤 1~7）：物化 → 预处理 → 传输形态 → 逐源尝试 → 合并。"""
+        """单图流水线：物化 → 预处理 → 传输形态 → 逐源尝试 → 合并。"""
         search = cfg.get("search") or {}
         deadline_exhausted = False
         if time.time() >= deadline:
@@ -374,16 +386,24 @@ class ImageSearchPlugin(Star):
         pixels = image_io.image_pixels(data)
 
         # ---- 3) 传输形态：vision 一律 data URI，engine 一律图床 URL
+        # 只有候选里真的有 engine 源时才发布图片，避免「纯 vision 配置」也往图床
+        # 目录里落文件（v2.1.0 优化：多余磁盘占用）。
         data_uri = image_io.to_data_uri(data, ext)
-        public_url = self._publish_image(data, ext)
+        needs_public_url = any(
+            source.get("kind") == "engine" and source.get("valid", True)
+            for source in candidates
+        )
+        public_url = self._publish_image(data, ext) if needs_public_url else None
         image_input = {"data_uri": data_uri, "url": public_url}
 
-        # ---- 4) 缓存（键含图片哈希 + 生效 search_type + question；命中即零网络请求）
-        cache_key = search_core.ResultCache.make_key(data, search_type, question)
+        # ---- 4) 缓存（键含图片哈希 + search_type + question + intent；命中即零请求）
+        cache_key = search_core.ResultCache.make_key(
+            data, search_type, question, intent
+        )
         cached = self._cache.get(cache_key)
         if cached is not None:
             LOG.debug("cache hit for image %d", index)
-            # 缓存键只含图片哈希（PRD §3.5），同字节不同引用的图片各自回填自己的
+            # 缓存键只含图片哈希（PRD §3.2），同字节不同引用的图片各自回填自己的
             # index / ref（引用是逐图属性，不属于图片内容）
             cached["index"] = index
             cached["ref"] = search_core.ref_display(ref)
@@ -432,7 +452,9 @@ class ImageSearchPlugin(Star):
             source_started = time.time()
             try:
                 result = await asyncio.wait_for(
-                    self._run_source(cfg, source, image_input, question, timeout_sec),
+                    self._run_source(
+                        cfg, source, image_input, question, intent, timeout_sec
+                    ),
                     timeout=timeout_sec + _PER_SOURCE_GRACE_SEC,
                 )
             except asyncio.TimeoutError:
@@ -550,19 +572,22 @@ class ImageSearchPlugin(Star):
         source: dict,
         image_input: dict,
         question: str,
+        intent: str,
         timeout_sec: float,
     ) -> dict:
         """调用单个源，统一返回 `{ok, miss, challenge, match, answer, error}`。"""
         if source["kind"] == "engine":
             return await self._run_engine_source(cfg, source, image_input, timeout_sec)
-        return await self._run_vision_source(source, image_input, question, timeout_sec)
+        return await self._run_vision_source(
+            source, image_input, question, intent, timeout_sec
+        )
 
     async def _run_engine_source(
         self, cfg: dict, source: dict, image_input: dict, timeout_sec: float
     ) -> dict:
         """B 类源：调用 `search_engines.run_engine(engine, image, cfg, timeout_sec)`。
 
-        `run_engine` 由引擎适配器（`search_engines.py`）提供，契约见 PRD §4.1：
+        `run_engine` 由引擎适配器（`search_engines.py`）提供，契约见 PRD §4：
         任何异常都由它内部收敛成统一 dict，本方法再做一次防御性归一。
         """
         engine = str(source.get("engine") or "")
@@ -616,9 +641,14 @@ class ImageSearchPlugin(Star):
         }
 
     async def _run_vision_source(
-        self, source: dict, image_input: dict, question: str, timeout_sec: float
+        self,
+        source: dict,
+        image_input: dict,
+        question: str,
+        intent: str,
+        timeout_sec: float,
     ) -> dict:
-        """A 类源：解析端点 → OpenAI 兼容调用 → VERDICT 命中判定（PRD §3.3 / §4.7）。"""
+        """A 类源：解析端点 → OpenAI 兼容调用 → VERDICT 命中判定（PRD §3.3 / §2.2）。"""
         provider = self._resolve_provider(source)
         try:
             endpoint = provider_reader.resolve_source_endpoint(
@@ -633,7 +663,7 @@ class ImageSearchPlugin(Star):
             text = await provider_reader.call_vision_source(
                 endpoint,
                 system_prompt=system_prompt,
-                user_prompt=prompts.build_user_prompt(question),
+                user_prompt=prompts.build_user_prompt(question, intent),
                 data_uri=image_input.get("data_uri") or "",
                 timeout_sec=float(timeout_sec),
                 extra_headers=source.get("extra_headers") or {},
@@ -674,7 +704,7 @@ class ImageSearchPlugin(Star):
             return None
 
     def _resolve_provider(self, source: dict):
-        """provider 形态源解析 Provider 实例（PRD §4.7：失败取 id 末段再试一次）。"""
+        """provider 形态源解析 Provider 实例（PRD §2.2：失败取 id 末段再试一次）。"""
         ref = str(source.get("provider_ref") or "").strip()
         if not ref:
             return None
@@ -696,7 +726,7 @@ class ImageSearchPlugin(Star):
         """把图片发布到内置图床并返回公网 URL；图床未就绪/发布失败返回 None。
 
         公网前缀（`_public_base`）只在 `image_url.enabled=true` 且内置服务启动成功时
-        由 `initialize()` 预计算，因此它同时代表「图床可用」（PRD §3.3.4）。
+        由 `initialize()` 预计算，因此它同时代表「图床可用」（PRD §3.1）。
         """
         if not self._image_dir or not self._public_base:
             return None
@@ -710,9 +740,9 @@ class ImageSearchPlugin(Star):
     def _exceeds_source_limits(
         self, cfg: dict, source: dict, data: bytes, pixels: int
     ) -> bool:
-        """该图是否超出该源自身的体积/像素上限（PRD §2.4.6，**仅 vision 源**）。
+        """该图是否超出该源自身的体积/像素上限（PRD §2.3，**仅 vision 源**）。
 
-        PRD §2.4.6 的 P6 冻结澄清：engine 模板没有 `max_size_mb` / `max_pixels`
+        PRD §2.3 的冻结澄清：engine 模板没有 `max_size_mb` / `max_pixels`
         字段，engine 源不参与任何源级大小判定（不得出现 `image_too_large_for_source`）。
         """
         if source.get("kind") != "vision":
@@ -764,7 +794,7 @@ class ImageSearchPlugin(Star):
     ) -> None:
         """请求前钩子：把消息里的图片路径可读化 + 注入 image_search 工具提示。
 
-        受 `tool_hint_enabled` 控制（PRD §2.7）；任何异常都不阻断请求。
+        受 `tool_hint_enabled` 控制（PRD §2.1）；任何异常都不阻断请求。
         """
         cfg = self._active_cfg()
         if not cfg.get("tool_hint_enabled", True):

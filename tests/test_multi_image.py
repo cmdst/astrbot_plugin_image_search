@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from conftest import config_with_sources, custom_vision_source, variant_data_uri
 
 import main as plugin_main
@@ -99,12 +101,20 @@ class TestMultiImageIsolation:
         original = plugin._run_one_image
 
         async def slow(
-            cfg, index, ref, question, search_type, candidates, deadline, notes
+            cfg, index, ref, question, intent, search_type, candidates, deadline, notes
         ):
             if index == 1:
                 await asyncio.sleep(5)
             return await original(
-                cfg, index, ref, question, search_type, candidates, deadline, notes
+                cfg,
+                index,
+                ref,
+                question,
+                intent,
+                search_type,
+                candidates,
+                deadline,
+                notes,
             )
 
         plugin._run_one_image = slow

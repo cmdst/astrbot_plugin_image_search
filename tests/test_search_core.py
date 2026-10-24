@@ -2,7 +2,7 @@
 
 覆盖点：
 - `search_sources` 三种形态（list / dict / JSON 字符串）都归一为 keyed dict；
-- 非法条目（无法识别模板 / vision 端点缺失 / engine 名非法 / desc 空）被剔出可用源
+- 非法条目（无法识别模板 / vision 端点缺失 / engine 名非法）被剔出可用源
   并留 `valid=False` + 英文告警，不抛异常；
 - id 去重与自动生成（PRD §2.4.1）；
 - `merge_results` 去重 / 顺序 / 相似度取最高 / `merge_max_sources` 上限；
@@ -219,28 +219,24 @@ class TestSourceValidation:
             == "missing_endpoint"
         )
 
-    def test_desc_blank_no_longer_invalidates(self):
-        """v2.0.0 repair：删除 desc 判非法规则 —— 非法只依据 §2.4.1~§2.4.4。"""
-        cfg = normalize_config(config_with_sources(engine_source(desc="   ")))
+    def test_desc_is_dropped_as_unknown_key(self, caplog):
+        """v2.1.0：v1.7 遗留的 desc / description 不再透传，按未知键丢弃并告警。"""
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            cfg = normalize_config(
+                config_with_sources(engine_source(desc="图搜图备用", description="x"))
+            )
         source = cfg["search_sources"]["saucenao-1"]
+        assert "desc" not in source and "description" not in source
         assert source["valid"] is True
-        assert source["invalid_reason"] == ""
-        assert source["desc"] == ""
-
-    def test_desc_absent_is_valid(self):
-        cfg = normalize_config(config_with_sources(engine_source()))
-        assert cfg["search_sources"]["saucenao-1"]["valid"] is True
-
-    def test_desc_declared_is_valid_and_passthrough(self):
-        cfg = normalize_config(config_with_sources(engine_source(desc="图搜图备用")))
-        assert cfg["search_sources"]["saucenao-1"]["desc"] == "图搜图备用"
-        assert cfg["search_sources"]["saucenao-1"]["valid"] is True
+        assert "unknown key 'desc' is ignored" in caplog.text
+        assert "unknown key 'description' is ignored" in caplog.text
 
     def test_invalidity_matrix_follows_2_4_1_to_4(self):
         """非法判定矩阵：只由模板可识别 / vision 端点 / engine 名决定。"""
         cases = [
             ({"engine": "saucenao"}, True, ""),
-            ({"engine": "saucenao", "desc": ""}, True, ""),
             ({"engine": "google_lens"}, False, "invalid_engine"),
             ({"engine": ""}, False, "invalid_engine"),
             ({"provider_ref": "x/y"}, True, ""),
@@ -284,7 +280,7 @@ class TestSourceValidation:
         """归一化产物自身的键不算未知键（幂等：再次归一化不产生告警）。"""
         cfg = normalize_config(
             config_with_sources(
-                vision_source(model="hand-model"), engine_source(desc="")
+                vision_source(model="hand-model"), engine_source()
             )
         )
         assert "model_ignored" in cfg["search_sources"]["doubao-search"]
@@ -576,6 +572,7 @@ class TestPayloadsAndHints:
             "status",
             "search_type",
             "question",
+            "intent",
             "images",
             "summary",
             "hint",
@@ -583,6 +580,7 @@ class TestPayloadsAndHints:
             "cached",
             "notes",
         }
+        assert payload["intent"] == ""
         only_ok = json.loads(build_results_payload([ok_image]))
         assert only_ok["ok"] is True and only_ok["status"] == "ok"
 
@@ -753,9 +751,32 @@ class TestCacheAndHealth:
     def test_cache_key_formula(self):
         import hashlib
 
-        key = ResultCache.make_key(b"abc", "auto", "这是谁")
-        expected = f"{hashlib.sha256(b'abc').hexdigest()}|auto|这是谁"
+        key = ResultCache.make_key(b"abc", "auto", "这是谁", "像初音未来")
+        expected = (
+            f"{hashlib.sha256(b'abc').hexdigest()}|"
+            '["auto","这是谁","像初音未来"]'
+        )
         assert key == expected
+
+    def test_cache_key_changes_with_intent(self):
+        first = ResultCache.make_key(b"abc", "auto", "这是谁", "初音未来")
+        second = ResultCache.make_key(b"abc", "auto", "这是谁", "明日方舟")
+        assert first != second
+
+    def test_cache_key_is_unambiguous_when_text_contains_separator(self):
+        first = ResultCache.make_key(b"abc", "auto", "a|b", "")
+        second = ResultCache.make_key(b"abc", "auto", "a", "b")
+        assert first != second
+
+    def test_cache_evicts_oldest_when_max_items_reached(self):
+        cache = ResultCache(300, max_items=2)
+        cache.set("a", {"index": 0})
+        cache.set("b", {"index": 1})
+        cache.get("a")  # 命中 a，a 变为最近使用
+        cache.set("c", {"index": 2})
+        assert cache.get("b") is None
+        assert cache.get("a") == {"index": 0}
+        assert cache.get("c") == {"index": 2}
 
     def test_cache_ttl_zero_disables(self):
         cache = ResultCache(0)

@@ -1,4 +1,4 @@
-r"""image_io.py -- 搜图图片 IO：引用物化 / SSRF 防护 / 体积像素校验 / 压缩 / 传输形态（v2.0.0）。
+r"""image_io.py -- 搜图图片 IO：引用物化 / SSRF 防护 / 体积像素校验 / 压缩 / 传输形态（v2.1.0）。
 
 本模块由旧插件 `astrbot_plugin_vision_router/bridge_core.py` 按需裁剪搬迁（不重写
 SSRF 与压缩逻辑），仅做三处对齐 PRD 的改动：

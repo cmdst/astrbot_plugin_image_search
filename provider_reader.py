@@ -1,4 +1,4 @@
-"""provider_reader.py -- A 类（vision）源端点解析与 OpenAI 兼容调用（v2.0.0）。
+"""provider_reader.py -- A 类（vision）源端点解析与 OpenAI 兼容调用（v2.1.0）。
 
 保留（从旧插件 `astrbot_plugin_vision_router/provider_reader.py` 改造）：
 1. **Provider 数据源读取**：优先 AstrBot 官方接口（`context.provider_manager`
@@ -11,7 +11,7 @@
 3. **HTTP 调用**：`httpx` 直连 OpenAI `chat/completions`，超时由调用方传入，
    失败抛异常由上层转成 `attempts[].outcome="error"`（不在此处吞异常）。
 
-**v2.0.0 删除的代码与依据**（PRD §0 边界①「彻底删除 analyze 识图池」、§3.2
+**旧版删除的代码与依据**（PRD §0 边界①「彻底删除 analyze 识图池」与 §3.1
 「禁止任何形式的『质量不满意换 AI』『报错换 AI 直到成功』『兜底直判』逻辑」）：
 - `pick_router_provider()`（按标签/默认 provider 选路由 LLM 的候选清单逻辑）：
   预路由与候选清单已删除，新插件只是**按配置顺序**把图交给 vision 源，无选择环节；
@@ -19,10 +19,10 @@
   该补丁服务于「路由 LLM 输出决策 JSON」，新插件不解析任何决策 JSON；
 - `parse_router_json()`（从路由 LLM 响应里抠 `{"ai": "id"}`）：决策 JSON 已不存在；
 - `list_providers()` / `find_provider_by_api_base()` / `get_provider_models()`
-  （下拉/迁移/模型列表辅助）：服务于 analyze 池的 WebUI 与迁移匹配，v2.0 迁移只做
-  `route.llm_provider → provider_ref` 字符串搬运（PRD §6.2），无需读全量 provider 列表。
+  （下拉/模型列表辅助）：服务于 analyze 池的 WebUI 选择，新插件按 `provider_ref`
+  直接解析，无需读全量 provider 列表。
 
-**经验保留（PRD §4.7 统一约束）**：思考档位关闭时**完全不下发** `reasoning` /
+**经验保留（PRD §2.2 统一约束）**：思考档位关闭时**完全不下发** `reasoning` /
 `reasoning_effort` 字段——旧实现里「思考档位 false = 不下发」正是为了修复
 `reasoning: null` 触发端点 400 的问题，本模块的请求体只包含冻结的键
 （`model` / `messages` / `stream`），`None` 值字段一律不出现。
@@ -46,7 +46,7 @@ VISION_MODALITY_HINTS = ("image", "vision")
 # 兼容 OpenAI chat/completions 的 provider type
 CHAT_COMPATIBLE_TYPES = ("openai_chat_completion", "openai", "openai_compatible")
 
-# 错误文本里响应体的最大长度（PRD §4.7：HTTP 非 2xx → error 取响应体前 200 字）
+# 错误文本里响应体的最大长度（PRD §2.2：HTTP 非 2xx → error 取响应体前 200 字）
 ERROR_BODY_CHARS = 200
 
 
@@ -205,7 +205,7 @@ def _extract_key(entry: dict) -> str:
 
 
 def mask_api_key(key: str) -> str:
-    """密钥脱敏：仅保留前 4 位 + `***`（PRD §1.6.4）。"""
+    """密钥脱敏：仅保留前 4 位 + `***`（PRD §1.4）。"""
     text = (key or "").strip()
     if not text:
         return ""
@@ -246,7 +246,7 @@ def find_provider_entry(
 
 
 def _entry_from_instance(provider: Any) -> dict | None:
-    """从 Provider 实例或其 provider_manager 读合并配置（PRD §4.7 provider_config 路径）。"""
+    """从 Provider 实例或其 provider_manager 读合并配置（PRD §2.2 provider_config 路径）。"""
     if provider is None:
         return None
     config = getattr(provider, "provider_config", None)
@@ -262,7 +262,7 @@ def resolve_source_endpoint(
     provider_manager: Any | None = None,
     config_path: str = "",
 ) -> dict:
-    """解析 A 类源的实际调用端点（PRD §4.7）。
+    """解析 A 类源的实际调用端点（PRD §2.2）。
 
     返回 `{"api_base", "key", "model", "provider_id", "vision", "source"}`：
     - `form="provider"`：provider 实例（`context.get_provider_by_id(ref)`，失败已由
@@ -337,7 +337,7 @@ def build_chat_url(api_base: str) -> str:
 def build_vision_payload(
     model: str, system_prompt: str, user_prompt: str, data_uri: str
 ) -> dict:
-    """构造 OpenAI 兼容请求体（PRD §4.7 冻结形状）。
+    """构造 OpenAI 兼容请求体（PRD §2.2 冻结形状）。
 
     messages 为 system（搜图系统提示词）+ user（文本块 + `image_url` 图片块）；
     图片只走 data URI（不依赖图床）。**只输出冻结的三个键**，不额外下发

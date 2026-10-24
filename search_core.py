@@ -1,29 +1,23 @@
-"""search_core.py -- 搜图路由 Agent v2.0.0 配置归一化 / 源池 / 结果装配（纯函数，无 astrbot 依赖）。
+"""search_core.py -- 搜图路由 Agent v2.1.0 配置归一化 / 源池 / 结果装配（纯函数，无 astrbot 依赖）。
 
-职责边界（PRD §2 / §3 / §5 冻结契约）：
-1. 默认值常量：`DEFAULT_SEARCH`（PRD §2.5 九键）、`DEFAULT_IMAGE_URL`（§2.6）、
-   `DEFAULT_GLOBAL`（§2.1 顶层键）；
+职责边界：
+1. 默认值常量：`DEFAULT_SEARCH`、`DEFAULT_IMAGE_URL`、`DEFAULT_GLOBAL`；
 2. `load_config()`：读插件配置（优先 AstrBot data 目录，逐级回退，绝不把某个绝对
    路径写成唯一路径）；
 3. `normalize_config()`：把 `search_sources` 归一到 **keyed dict**（容忍 dict / list /
    JSON 字符串三种形态），逐键校验类型与范围，非法值回落默认值 + 英文告警，不阻断加载；
-4. `enabled_sources()` / `select_candidates()`：候选源顺序（PRD §1.2 冻结：auto 先
-   engine 后 vision，数组顺序，不排序、不按健康度重排）；
+4. `enabled_sources()` / `select_candidates()`：候选源顺序（auto 先 engine 后 vision，
+   数组顺序，不排序、不按健康度重排）；
 5. `build_image_result()` / `build_results_payload()` / `merge_results()`：返回体逐字段
-   装配与多源命中合并去重（PRD §1.4 / §1.5 / §3.4）；
-6. `ResultCache` / `HealthStats`：结果缓存（§3.5）与源健康统计（同一节）。
+   装配与多源命中合并去重；
+6. `ResultCache` / `HealthStats`：结果缓存（含 intent）与源健康统计。
 
 本模块不 import astrbot 内部实现（仅用 `astrbot.api.logger`），便于离线单测。
-日志一律英文（PRD §2.7）。
+日志一律英文。
 
-**与验收口径的显式取舍（供 verifier / reviewer 核对）**：PRD §2.4.1 冻结
-「`id` 为空 → 自动生成 `{kind}_{下标}`」，因此缺 `id` 的条目**不**被丢弃（自动补 id）；
-被判为非法并「剔出可用源集合」的情况**只**依据 §2.4.1~§2.4.4：`__template_key`/形态无法
-识别、vision 源 `provider_ref` 与 `api_base`+`model` 均空、engine 源 `engine` 名不在枚举内
-（v2.0.0 repair 已删除原先的 `desc` 判非法规则与 `_desc_declared` 标记）。非法条目保留在
-`cfg["search_sources"]`（带 `valid=False`），以便按 PRD §5 出现在 `attempts` 里
-（`outcome="skipped"`、`error="invalid_source"`），但**永不参与实际请求**。
-字段表（§2.2/§2.3）之外的未知键一律丢弃并逐键 WARNING（含源 id 与键名）。
+**非法源判定**：只依据模板可识别 / vision 源 `provider_ref` 或
+`api_base`+`model` / engine 源 `engine` 名在枚举内。v2.1.0 已移除 v1.7 时代遗留的
+`desc` / `description` 透传字段；字段表之外的未知键一律丢弃并逐键 WARNING。
 """
 
 from __future__ import annotations
@@ -91,17 +85,15 @@ LOG_LEVELS = ("debug", "info", "warning", "error")
 SEARCH_TYPES = ("auto", "vision", "engine")
 ENGINE_NAMES = ("saucenao", "ascii2d", "trace_moe")
 
-# 归一化接受的字段（PRD §2.2 / §2.3 字段表 + 模板标记 + 本模块内部标记）。
-# 表外键一律丢弃并发 WARNING（v2.0.0 repair：禁止静默吞掉未知键，
-# 例如给 engine 模板误加 size/pixels —— §2.3 没有这两个字段）。
+# 归一化接受的字段（字段表 + 模板标记 + 本模块内部标记）。
+# 表外键一律丢弃并发 WARNING，禁止静默吞掉未知键
+# （例如给 engine 模板误加 size/pixels —— engine 模板没有这两个字段）。
 KNOWN_SOURCE_KEYS: dict[str, frozenset] = {
     "vision": frozenset(
         {
             "enabled",
             "id",
             "name",
-            "desc",
-            "description",
             "provider_ref",
             "api_base",
             "api_key",
@@ -118,8 +110,6 @@ KNOWN_SOURCE_KEYS: dict[str, frozenset] = {
             "enabled",
             "id",
             "name",
-            "desc",
-            "description",
             "engine",
             "api_key",
             "base_url",
@@ -138,9 +128,10 @@ ENGINE_DEFAULT_NAMES = {
     "trace_moe": "trace.moe",
 }
 
-# 工具参数约束（PRD §1.2）
+# 工具参数约束
 MAX_IMAGE_REFS = 8
 MAX_QUESTION_CHARS = 500
+MAX_INTENT_CHARS = 300
 MAX_REF_CHARS = 200
 MAX_SUMMARY_CHARS = 800
 
@@ -172,8 +163,12 @@ SKIP_REASON_TEXT = {
 # 总预算耗尽的图片级文案（v2.0.0 repair：与「候选源为空」区分开）
 TOTAL_TIMEOUT_ERROR = "本次调用总时限已耗尽，未尝试搜图源（total_timeout）。"
 
-# 缓存键分隔符（PRD §3.5：sha256(图片字节) + "|" + search_type + "|" + question）
+# 缓存键分隔符（sha256(图片字节) + "|" + JSON([search_type, question, intent])）
+# JSON 数组保证字段边界无歧义（question / intent 里出现 "|" 也不会撞键）。
 CACHE_KEY_SEP = "|"
+
+# 缓存条数上限：TTL 内大量图片也不至于无限占用内存（LRU 淘汰最旧条目）。
+CACHE_MAX_ITEMS = 256
 
 # 引用不可读类错误码（PRD §1.4 `bad_refs` 判定）
 UNREADABLE_ERRORS = (
@@ -248,11 +243,6 @@ def astrbot_data_dir() -> Path:
 def plugin_config_path() -> Path:
     """插件配置落盘路径：`{data}/config/astrbot_plugin_image_search_config.json`。"""
     return astrbot_data_dir() / "config" / "astrbot_plugin_image_search_config.json"
-
-
-def legacy_config_path() -> Path:
-    """v1.7 旧插件配置路径（仅供启动期迁移提示，不读取、不迁移，PRD §6.4）。"""
-    return astrbot_data_dir() / "config" / "astrbot_plugin_vision_router_config.json"
 
 
 def load_config(explicit: dict | None = None) -> dict:
@@ -457,10 +447,8 @@ def normalize_search_source(
     """
     source_id = _unique_source_id(_as_str(raw.get("id")) or f"{kind}_{index}", used_ids)
     _warn_unknown_keys(kind, source_id, raw)
-    # v2.0.0 repair：删除 desc 判非法规则 —— 非法性**只**依据 PRD §2.4.1~§2.4.4
-    # （模板可识别 / vision provider_ref 或 api_base+model / engine 名在枚举内）。
-    # `desc`（及 `description`）仅作为非 PRD 的可选描述字段透传，不参与任何判定。
-    desc = _as_str(raw.get("desc") or raw.get("description"))
+    # 非法性只依据：模板可识别 / vision provider_ref 或 api_base+model /
+    # engine 名在枚举内。v2.1.0 起不再透传 v1.7 的 desc / description。
     invalid_reason = ""
 
     if kind == "engine":
@@ -473,7 +461,6 @@ def normalize_search_source(
             "kind": "engine",
             "id": source_id,
             "name": _as_str(raw.get("name")) or default_name,
-            "desc": desc,
             "enabled": _as_bool(raw.get("enabled", True), True, f"{source_id}.enabled"),
             "valid": not invalid_reason,
             "invalid_reason": invalid_reason,
@@ -504,7 +491,6 @@ def normalize_search_source(
         "kind": "vision",
         "id": source_id,
         "name": _as_str(raw.get("name")) or source_id,
-        "desc": desc,
         "enabled": _as_bool(raw.get("enabled", True), True, f"{source_id}.enabled"),
         "valid": not invalid_reason,
         "invalid_reason": invalid_reason,
@@ -527,8 +513,8 @@ def normalize_search_source(
 def normalize_sources(raw_sources) -> dict[str, dict]:
     """把 search_sources 归一到 keyed dict（保序，key = 源 id）。
 
-    非法条目（无法识别模板 / vision 端点缺失 / engine 名非法 / desc 空）**保留**，
-    但 `valid=False`：它们永不发起请求，仅按 PRD §5 出现在 `attempts`。
+    非法条目（无法识别模板 / vision 端点缺失 / engine 名非法）**保留**，
+    但 `valid=False`：它们永不发起请求，只出现在 `attempts`。
 
     Args:
         raw_sources: list / dict / JSON 字符串形态的源池。
@@ -754,6 +740,20 @@ def normalize_question(value, notes: list[str]) -> str:
     return text
 
 
+def normalize_intent(value, notes: list[str]) -> str:
+    """`intent` 归一化：非 str 强转；超 300 字截断并记 `intent_truncated`。
+
+    `intent` 是主模型给搜图模型的线索（角色 / 作品 / 场景等）。它只进入
+    vision 提示词与缓存键，不参与 engine 请求。
+    """
+    text = value if isinstance(value, str) else ("" if value is None else str(value))
+    text = text.strip()
+    if len(text) > MAX_INTENT_CHARS:
+        notes.append("intent_truncated")
+        return text[:MAX_INTENT_CHARS]
+    return text
+
+
 def normalize_refs(image_refs, notes: list[str]) -> list[str]:
     """`image_refs` 归一化：保序去重、最多 8 张（超出记 `refs_truncated:8`）。
 
@@ -894,6 +894,7 @@ def build_results_payload(
     status: str | None = None,
     search_type: str = "auto",
     question: str = "",
+    intent: str = "",
     summary: str = "",
     hint: str = "",
     elapsed_ms: int = 0,
@@ -906,6 +907,7 @@ def build_results_payload(
         status: 显式状态；None 时由 `aggregate_status()` 推导。
         search_type: 实际生效的源选择策略。
         question: 截断后的用户问题回显。
+        intent: 截断后的检索线索回显（空串表示未提供）。
         summary: 面向主模型的可读摘要。
         hint: 运维/配置引导文案。
         elapsed_ms: 本次调用总耗时（毫秒）。
@@ -921,6 +923,7 @@ def build_results_payload(
         "status": final_status,
         "search_type": search_type,
         "question": question,
+        "intent": intent,
         "images": images,
         "summary": summary,
         "hint": hint,
@@ -938,6 +941,7 @@ def build_failure_payload(
     *,
     search_type: str = "auto",
     question: str = "",
+    intent: str = "",
     notes: list[str] | None = None,
     elapsed_ms: int = 0,
     images: list[dict] | None = None,
@@ -950,6 +954,7 @@ def build_failure_payload(
         hint: 引导文案。
         search_type: 实际生效的源选择策略。
         question: 问题回显。
+        intent: 检索线索回显。
         notes: 补充说明。
         elapsed_ms: 耗时（毫秒）。
         images: 逐图结果（内部错误时可携带已处理结果）。
@@ -962,6 +967,7 @@ def build_failure_payload(
         status=status,
         search_type=search_type,
         question=question,
+        intent=intent,
         summary=summary,
         hint=hint,
         elapsed_ms=elapsed_ms,
@@ -1274,17 +1280,31 @@ def render_hint(images: list[dict], status: str, search_type: str = "auto") -> s
 
 
 class ResultCache:
-    """逐图结果缓存：键 = `sha256(图片字节) | search_type | question`（PRD §3.5）。"""
+    """逐图结果缓存：图片字节哈希 + 文本参数，TTL + 条数双上限。
 
-    def __init__(self, ttl_sec: int = 0) -> None:
+    缓存键 = `sha256(图片字节) + "|" + JSON([search_type, question, intent])`。
+    用 JSON 数组而不是直接拼字符串，是为了让 `intent` / `question` 中的 `|`
+    不会造成键歧义。`get()` 会把命中项移到队尾（LRU），`set()` 在超过
+    `max_items` 时淘汰最旧条目。
+    """
+
+    def __init__(self, ttl_sec: int = 0, max_items: int = CACHE_MAX_ITEMS) -> None:
         self.ttl_sec = max(int(ttl_sec or 0), 0)
+        self.max_items = max(int(max_items or 1), 1)
         self._items: dict[str, tuple[float, dict]] = {}
 
     @staticmethod
-    def make_key(data: bytes, search_type: str, question: str) -> str:
-        """按 PRD §3.5 冻结公式计算缓存键。"""
+    def make_key(
+        data: bytes, search_type: str, question: str, intent: str = ""
+    ) -> str:
+        """计算缓存键（字段边界用 JSON 编码，intent 参与键）。"""
         digest = hashlib.sha256(data).hexdigest()
-        return CACHE_KEY_SEP.join((digest, search_type or "auto", question or ""))
+        params = json.dumps(
+            [search_type or "auto", question or "", intent or ""],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return f"{digest}{CACHE_KEY_SEP}{params}"
 
     def get(self, key: str) -> dict | None:
         """取缓存（深拷贝）；过期或未命中返回 None。"""
@@ -1297,12 +1317,18 @@ class ResultCache:
         if time.time() - stored_at > self.ttl_sec:
             self._items.pop(key, None)
             return None
+        # 命中即视为最近使用：移到队尾（dict 保序）
+        self._items[key] = self._items.pop(key)
         return copy.deepcopy(payload)
 
     def set(self, key: str, image_obj: dict) -> None:
         """写缓存（深拷贝；ttl<=0 时不写，即关闭缓存）。"""
         if self.ttl_sec <= 0 or not key:
             return
+        if key in self._items:
+            self._items.pop(key)
+        while len(self._items) >= self.max_items:
+            self._items.pop(next(iter(self._items)))
         self._items[key] = (time.time(), copy.deepcopy(image_obj))
 
     def clear(self) -> None:
@@ -1430,11 +1456,3 @@ def image_url_dir(cfg: dict) -> str:
     except Exception:  # noqa: BLE001 -- 官方路径不可用时回退 data 目录
         base = astrbot_data_dir() / "plugin_data"
     return str(base / "astrbot_plugin_image_search" / "imgserv")
-
-
-def detect_migration_hint() -> bool:
-    """新配置缺失但旧 v1.7 配置存在时返回 True（启动期只打一条 WARNING，PRD §6.4）。"""
-    try:
-        return (not plugin_config_path().exists()) and legacy_config_path().exists()
-    except OSError:
-        return False

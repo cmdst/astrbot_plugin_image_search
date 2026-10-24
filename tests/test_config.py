@@ -1,24 +1,20 @@
-"""test_config.py -- 插件配置读取与全局键归一化单测（PRD §2.1 / §2.6 / §2.8 / §6.4）。
+"""test_config.py -- 插件配置读取与全局键归一化单测。
 
 覆盖点：
 - `load_config()` 的显式配置优先 / 文件回退 / BOM 兼容 / 非法 JSON 不抛异常；
 - data 目录解析走 AstrBot 官方路径工具，且绝不把某个绝对路径当唯一路径；
 - `image_url` 小节逐键归一化（默认关闭、端口范围、前缀去尾斜杠）；
-- v1.7 旧配置存在而 v2.0 新配置缺失时的迁移提示位。
+- Star 注入配置与文件回退的优先级。
 """
 
 from __future__ import annotations
 
 import json
 
-import pytest
-
 from search_core import (
     DEFAULT_IMAGE_URL,
     DEFAULT_SEARCH,
     astrbot_data_dir,
-    detect_migration_hint,
-    legacy_config_path,
     load_config,
     normalize_config,
     plugin_config_path,
@@ -36,9 +32,6 @@ class TestPaths:
         assert path.name == "astrbot_plugin_image_search_config.json"
         assert path.parent.name == "config"
         assert path.parent.parent == astrbot_data_dir()
-
-    def test_legacy_config_path(self):
-        assert legacy_config_path().name == "astrbot_plugin_vision_router_config.json"
 
     def test_data_dir_matches_official_helper(self):
         from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -152,17 +145,6 @@ class TestGlobalSections:
         assert cfg["search_sources"] == {}
         assert cfg["search"] == DEFAULT_SEARCH
 
-    def test_migration_hint_flag(self, tmp_path, monkeypatch):
-        new_path = tmp_path / "new.json"
-        old_path = tmp_path / "old.json"
-        monkeypatch.setattr("search_core.plugin_config_path", lambda: new_path)
-        monkeypatch.setattr("search_core.legacy_config_path", lambda: old_path)
-        assert detect_migration_hint() is False  # 两者都不存在
-        old_path.write_text("{}", encoding="utf-8")
-        assert detect_migration_hint() is True  # 新缺失 + 旧存在 → 提示迁移
-        new_path.write_text("{}", encoding="utf-8")
-        assert detect_migration_hint() is False  # 新配置已存在 → 不再提示
-
 
 class TestConfigSource:
     def test_star_injected_config_wins_over_file(
@@ -226,48 +208,3 @@ class TestConfigSource:
         monkeypatch.setattr(importlib, "import_module", fake_import)
         monkeypatch.setenv("ASTRBOT_ROOT", str(tmp_path))
         assert search_core.astrbot_data_dir() == tmp_path / "data"
-
-
-class TestLegacyDirUntouched:
-    """旧插件目录零改动的独立证据（不依赖 `git status`：data/ 在 .gitignore 内）。"""
-
-    @staticmethod
-    def _legacy_dir():
-        from pathlib import Path
-
-        return Path(__file__).resolve().parents[2] / "astrbot_plugin_vision_router"
-
-    @staticmethod
-    def _baseline_file():
-        from pathlib import Path
-
-        return Path(__file__).resolve().parents[1] / "PRD.md"
-
-    def test_no_legacy_file_is_newer_than_v2_baseline(self):
-        legacy = self._legacy_dir()
-        baseline = self._baseline_file()
-        if not legacy.is_dir():
-            pytest.skip("旧插件目录不存在")
-        if not baseline.is_file():
-            pytest.skip("v2 基准文件（新插件 PRD.md）缺失")
-        baseline_mtime = baseline.stat().st_mtime
-        newer = sorted(
-            str(path.relative_to(legacy))
-            for path in legacy.rglob("*")
-            if path.is_file()
-            and "__pycache__" not in path.parts
-            and path.suffix != ".pyc"
-            and path.stat().st_mtime > baseline_mtime
-        )
-        assert newer == [], f"旧插件目录出现新写入：{newer}"
-
-    def test_legacy_tree_snapshot_is_nonempty(self):
-        legacy = self._legacy_dir()
-        if not legacy.is_dir():
-            pytest.skip("旧插件目录不存在")
-        files = [
-            path
-            for path in legacy.rglob("*")
-            if path.is_file() and "__pycache__" not in path.parts
-        ]
-        assert len(files) >= 50  # 冻结快照：60 个文件（排除 __pycache__）
