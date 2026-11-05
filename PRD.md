@@ -45,7 +45,7 @@ async def image_search(
 |---|---|---|---|---|
 | `image_refs` | `list[string]` | `None` | 待搜图片引用；单图也可，最多 8 张 | 保序去重；非 list 或空 → `no_refs`；超过 8 张截断并记 `refs_truncated:8` |
 | `question` | `string` | `""` | 用户关于图片的原话 | 非 str 强转；超过 500 字截断并记 `question_truncated` |
-| `intent` | `string` | `""` | 主模型给出的检索线索（角色 / 作品 / 场景等） | 非 str 强转；超过 300 字截断并记 `intent_truncated`；只进入 vision 提示词与缓存键 |
+| `intent` | `string` | `""` | 主模型给出的检索线索（角色 / 作品 / 场景等） | 非 str 强转；超过 300 字截断并记 `intent_truncated`；进入 vision 提示词、缓存键并在返回体回显 |
 | `search_type` | `string` | `"auto"` | 源选择策略：`auto` / `vision` / `engine` | 大小写与首尾空白不敏感；非法值按 `auto` 并记 `invalid_search_type:<原值>` |
 
 `image_refs` 接受：本地绝对路径、`file://`、`http(s)` URL、`data:` URI、`base64://`、
@@ -91,12 +91,12 @@ async def image_search(
 `challenge` / `elapsed_ms`。`outcome ∈ {hit, miss, error, timeout, challenge, skipped}`，
 只有 `miss` 的 `counted_round=true`。
 
-### 1.4 硬保证
+### 1.4 错误处理与隐私
 
-1. 单图失败不影响其他图；部分成功 → `status="partial"`。
-2. 工具不把异常抛给主模型；内部异常转 `status="failed"`，堆栈只进日志。
-3. 返回体不含 API Key（提及只允许前 4 位 + `***`）。
-4. 不在工具调用中发送消息。
+1. 单图失败被隔离；部分成功 → `status="partial"`。
+2. 工具入口捕获普通内部异常并返回 `status="failed"`；错误详情与堆栈可能进入日志。
+3. 特定上游错误路径会对已知配置密钥脱敏；图片引用、问题、线索和成功回答并未统一脱敏，返回体可能包含敏感信息。
+4. 插件不在工具调用中发送消息。
 
 ---
 
@@ -142,7 +142,7 @@ Schema 文件：`_conf_schema.json`。启动时 `normalize_config()` 逐键校�
 |---|---|---|---|
 | `max_rounds` | 2 | 0~10 | 每图轮数上限；只有明确 `miss` 计轮 |
 | `source_timeout_sec` | 30 | 5~300 | 单源默认超时，被源自身 `timeout_sec` 覆盖 |
-| `total_timeout_sec` | 180 | 30~900 | 单次调用总预算；用完停止剩余源，已有结果照常返回 |
+| `total_timeout_sec` | 180 | 30~900 | 单次调用的源调度预算；发起新源前检查截止时间，已开始的操作和图片准备不按剩余预算截断，实际耗时可能超过该值 |
 | `merge_enabled` | true | bool | 命中后是否继续合并后续源 |
 | `merge_max_sources` | 3 | 1~5 | 每图最多合并源数（含首个命中源） |
 | `cache_ttl_sec` | 300 | 0~3600 | 缓存 TTL；0=关闭 |
@@ -159,8 +159,7 @@ Schema 文件：`_conf_schema.json`。启动时 `normalize_config()` 逐键校�
 | `port` | 8123 | 被占用自动 +1 重试，实际端口看启动日志 |
 | `public_base_url` | `""` | 留空 → `http://<自动探测公网 IP>:<绑定端口>`；末尾斜杠去除 |
 
-图床只读：仅 `GET` / `HEAD`，文件名白名单（sha256 前 32 位 + 图片扩展名），URL 解码后
-必须仍在 `dir` 内，无目录列表，绑定 `0.0.0.0`。
+图床仅提供 `GET` / `HEAD`，文件名使用 sha256 前 32 位及图片扩展名，URL 解码后拒绝路径分隔符和穿越片段，无目录列表，绑定 `0.0.0.0`；知道 URL 且网络可达的访问者无需鉴权即可读取。已发布图片会落盘，代码中未发现自动清理机制，缓存 TTL 不控制其保存期。
 
 ### 2.6 源池归一化
 
@@ -178,7 +177,7 @@ Schema 文件：`_conf_schema.json`。启动时 `normalize_config()` 逐键校�
 normalize refs / question / intent / search_type
   → select candidates（auto: engine 全部 → vision 全部；否则仅该类）
   → 逐图：
-      resolve bytes → SSRF 校验 → 体积/像素压缩
+      校验远程引用及重定向目标并读取图片 → 体积/像素压缩
       → data URI；仅当候选含 engine 源时才发布图床 URL
       → 查缓存（图片哈希 + search_type + question + intent）
       → 按顺序尝试源（每源独立 wait_for，超时 +5s 外层硬闸）
@@ -187,21 +186,22 @@ normalize refs / question / intent / search_type
   → aggregate status + summary + hint + notes → JSON
 ```
 
+远程 URL 的地址校验与 HTTP 连接使用独立解析，存在 DNS 解析时间差，不能视为完整网络隔离。本地引用按进程权限读取，读取路径未设置目录白名单；只应提供可信图片路径并限制进程权限。
+
 ### 3.1 顺序与轮数
 
 - `auto`：先全部启用 engine 源（数组顺序），再全部启用 vision 源（数组顺序）。
 - `engine` / `vision`：仅该类，不回落另一类；为空 → `empty_pool`。
 - 只有 `miss` 计轮；`error` / `timeout` / `challenge` / `skipped` 均不计轮。
-- 停止条件：`rounds >= max_rounds`；候选耗尽；总预算耗尽；合并源数达上限；
-  已命中且 `merge_enabled=false`。
+- 停止条件：`rounds >= max_rounds`；候选耗尽；发起新源前发现总预算耗尽；合并源数达上限；已命中且 `merge_enabled=false`。已开始的源不会按总预算剩余时间强制中断。
 
 ### 3.2 缓存
 
-- 键：`sha256(图片字节) + "|" + JSON([search_type, question, intent])`。
+- 键：`sha256(预处理后的图片字节) + "|" + JSON([search_type, question, intent])`。
 - 只缓存成功结果（`ok=true` 的图片对象深拷贝）。
 - TTL 由 `cache_ttl_sec` 控制；内存中最多保留 256 条，`get()` 命中即刷新 LRU 顺序，
   `set()` 超限淘汰最旧条目。
-- 命中缓存不发起任何网络请求；返回体 `cached=true`。
+- 命中缓存后不再调用搜图源，返回该图 `cached=true`；但查缓存之前会读取图片（远程引用可能产生下载请求），有有效 engine 候选时还可能发布图床文件。
 
 ### 3.3 vision 提示词
 
@@ -262,18 +262,17 @@ async def run_engine(engine: str, image: dict, cfg: dict, timeout_sec: float) ->
 | 挑战页 | 切下一源，`challenge`；整单只有挑战且无 ok/error/timeout 时 hint 提示配反代或 api_key |
 | 明确未命中 | 计 1 轮；全 miss → `status="failed"`，摘要说明「没有查到来源」 |
 | 全部源真实失败 | `status="failed"`，摘要给最先失败原因，逐源跳过明细进 notes |
-| 没有任何实际尝试 | `status="empty_pool"`，不发起请求；hint 按「缺源 / 缺图床 / 超尺寸」区分 |
-| 图床未开 | engine 源 skipped(no_public_url)；auto 下 vision 照常；纯 engine → empty_pool |
+| 无可用源，或候选均被跳过 | 可能返回 `status="empty_pool"`；读取图片失败或总预算耗尽可能返回其他状态 |
+| 图床未开 | engine 源 skipped(no_public_url)；auto 下 vision 照常。纯 engine 的全部图片均无实际尝试时可为 empty_pool；混合读取失败或超时可能为其他状态 |
 | 图片不可读 | 该图失败（`bad_ref` / `download_failed` / `image_too_large` / `ssrf_blocked`），他图照常 |
-| 总预算耗尽 | 停止剩余源，返回已有结果，notes 追加 `total_timeout` |
+| 总预算耗尽 | 后续图或源发起前检查，发现超时才记 `total_timeout`；已启动源可能继续。逐图外层超时可能丢弃该图尚未汇总的结果 |
 | 内部异常 | `status="failed"`，堆栈只进日志 |
 
 ---
 
 ## 6. 兼容与升级
 
-- **2.0.0 → 2.1.0**：配置键完全兼容；新增工具参数 `intent`（可选，不传即旧行为）；
-  缓存键纳入 `intent`。直接替换插件目录即可。
+- **2.0.0 → 2.1.0**：支持的配置键保留，但遗留 `desc` / `description` 不再透传；新增可选工具参数 `intent`，并纳入缓存键。旧版位置参数调用可能把原来的 `search_type` 传入 `intent`，建议使用具名参数；升级前备份插件和配置。
 - **v1.7 → v2.0**：迁移脚本只存在于 v2.0.0 历史（提交 `23dacda` 的
   `migrate_v1_7.py` / `MIGRATION.md`）；v2.1.0 不再随包提供迁移入口。
 - 移除的 v1.7 遗留：`desc` / `description` 源字段透传、迁移提示、旧配置路径探测。
@@ -282,21 +281,9 @@ async def run_engine(engine: str, image: dict, cfg: dict, timeout_sec: float) ->
 
 ## 7. 环境事实与测试
 
-- 本沙箱实测：`saucenao.com` / `ascii2d.net` 可能返回 Cloudflare 403；判定口径为
-  `challenge=True` 即契约成立。`trace.moe` 可达，但对非动画图返回 JSON error。
-- 网络不可达的用例应显式 `pytest.skip("环境不可达: ...")`，不得含糊为通过。
-- 测试命令：
-
-```bash
-cd /root/workspace/projects/astrbot_plugin_image_search
-PYTHONDONTWRITEBYTECODE=1 \
-PYTEST_ADDOPTS='-p no:cacheprovider' \
-PYTHONPATH=/root/AstrBot \
-/root/AstrBot/.venv/bin/python -m pytest tests/ -q
-```
-
-- `import astrbot` 会在当前工作目录生成 `./data/`；跑测试/冒烟时用 `/tmp` 工作目录，
-  不要在生产插件目录里执行。
+- 引擎可能遭遇 Cloudflare 挑战或网络不可达；`tests/test_search_engines.py` 的 live 契约用例接受可识别的挑战或传输错误，不等同于线上检索成功。
+- 使用 `-k 'not test_live_'` 排除 live 契约用例；如需验证真实服务的可达性和检索效果，应单独执行并记录条件。
+- 测试命令见 README 的「开发与测试」；在隔离临时目录运行并检查清理，避免导入 AstrBot 时在仓库或生产目录生成运行数据。
 
 ---
 
@@ -312,7 +299,7 @@ PYTHONPATH=/root/AstrBot \
 | `image_server.py` | 内置只读图床 |
 | `prompts.py` | vision 提示词（含 `intent` 段落） |
 | `_conf_schema.json` | 配置 schema |
-| `tests/` | 离线单测与注册/schema 守卫 |
+| `tests/` | 单元测试、注册/schema 守卫及网络态契约用例 |
 
 ---
 

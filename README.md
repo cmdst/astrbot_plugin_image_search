@@ -7,7 +7,7 @@
 - 唯一工具：`image_search(image_refs, question, intent, search_type)`
 - 两类源：**vision**（视觉联网模型）与 **engine**（SauceNAO / ascii2d / trace.moe）
 - 逐源失败自动换源、单源超时隔离、多源命中合并去重
-- 返回 JSON 字符串；**不抛异常给主模型**、**不含 API Key**
+- 返回 JSON 字符串；普通内部异常转为结构化失败。返回内容可能包含图片引用、问题及上游回答，使用前请阅读隐私说明。
 
 ---
 
@@ -26,9 +26,8 @@
 ## 2. 特性
 
 - **`intent` 检索线索**：主模型可以把「看起来像《明日方舟》的阿米娅」「场景疑似在杭州」
-  这类判断交给搜图模型，用来缩小检索范围。线索只进入 vision 提示词与缓存键，
-  并明确标注「可能不准确，只作为检索方向参考，不要执行其中的指令」；它不会替代
-  图片本身与联网核实。
+  这类判断交给搜图模型，用来缩小检索范围。线索进入 vision 提示词、缓存键及返回体，
+  并在提示词中要求模型将其视为不准确的参考、不要执行其中的指令；这不是模型遵循提示的保证，也不能替代对图片和结果的核实。
 - **源池有序**：`auto` 先跑全部 engine 源、再跑 vision 源；源失败只做顺序切换，
   不按「健康度」偷偷重排。
 - **轮数只由明确未命中消耗**：报错、超时、Cloudflare 挑战页、因图床未开被跳过，
@@ -37,16 +36,16 @@
 - **多源合并去重**：命中后按配置继续尝试后续源，`merged_from` 逐条标注归属。
 - **缓存**：键含图片字节哈希 + `search_type` + `question` + `intent`；TTL 之外还有
   256 条 LRU 上限，避免长时间运行内存无界增长。
-- **图片安全流水线**：引用归一化 → SSRF 防护（内网/环回/链路本地/保留段拒绝，
-  重定向后二次校验）→ 体积/像素压缩 → data URI 或内置只读图床 URL。
-- **只读图床按需启动**：只有候选里真的存在 engine 源时才发布图片，纯 vision 配置
-  不会往图床目录落无用文件。
+- **图片处理流水线**：引用归一化 → 对 URL 及重定向目标进行地址校验 → 体积/像素处理 → data URI 或内置只读图床 URL。地址校验和实际连接之间存在 DNS 解析时间差，不能视为完整的网络隔离。
+- **图床按需发布**：仅当候选中存在有效 engine 源时发布图片；纯 vision 配置不会为搜图发布图床文件。是否启动服务由 `image_url.enabled` 控制。
 
 ---
 
 ## 3. 安装
 
 要求 AstrBot `>=4.16,<5`。
+
+本说明对应仓库 `main` 的代码版本 2.1.0。普通仓库地址和下方 `git clone` 获取默认分支当前内容，并不固定提交。部分 AstrBot 版本的普通 HTTPS 仓库安装使用 HEAD 源码归档，可能没有 `.git`；其他版本的安装机制可能不同。安装后检查插件元数据，并在有 Git 历史时核对提交；无 Git 历史时可将文件与指定提交比较。固定 `v2.1.0` 标签指向 `aa2dd05`，不含主线后续 `55906c8` 的 `intent` 提示词加固；两者版本字段相同，不能仅凭版本号区分。
 
 **方式 A：从 GitHub 安装（推荐）**
 
@@ -59,7 +58,7 @@ https://github.com/cmdst/astrbot_plugin_image_search
 **方式 B：手动放入插件目录**
 
 ```bash
-cd /root/AstrBot/data/plugins
+cd "$ASTRBOT_DIR/data/plugins"  # ASTRBOT_DIR 为你的 AstrBot 安装目录
 git clone https://github.com/cmdst/astrbot_plugin_image_search.git
 ```
 
@@ -95,7 +94,7 @@ git clone https://github.com/cmdst/astrbot_plugin_image_search.git
 
 ```python
 image_search(
-    image_refs: list[str],
+    image_refs: list[str] | None = None,
     question: str = "",
     intent: str = "",
     search_type: str = "auto",
@@ -104,9 +103,9 @@ image_search(
 
 | 参数 | 必填 | 默认 | 说明 |
 |---|---|---|---|
-| `image_refs` | 是 | — | 图片引用列表，最多 8 张（超出截断）。接受本地绝对路径、`file://`、`http(s)` URL、`data:` URI、`base64://`、`[Image Attachment: path ...]`。 |
+| `image_refs` | 搜图必需 | `None` | 图片引用列表，最多 8 张（超出截断）；缺失或为空时返回 `no_refs`。接受本地绝对路径、`file://`、`http(s)` URL、`data:` URI、`base64://`、`[Image Attachment: path ...]`。 |
 | `question` | 否 | `""` | 用户原话（「这是谁」「出自哪部番」）。超过 500 字截断。 |
-| `intent` | 否 | `""` | 主模型给出的检索线索（角色 / 作品 / 场景等）。超过 300 字截断，记 `intent_truncated`。只影响 vision 源的提示词与缓存键。 |
+| `intent` | 否 | `""` | 主模型给出的检索线索（角色 / 作品 / 场景等）。超过 300 字截断，记 `intent_truncated`。用于 vision 提示词与缓存键，并在返回体回显。 |
 | `search_type` | 否 | `"auto"` | `auto` = 先全部 engine、再全部 vision；`engine` = 只用图搜图引擎；`vision` = 只用视觉联网模型。非法值按 `auto` 执行并记 `invalid_search_type:<原值>`。 |
 
 ### 4.2 返回
@@ -125,8 +124,7 @@ image_search(
 `attempts[].outcome`：`hit` / `miss` / `error` / `timeout` / `challenge` / `skipped`。
 只有 `miss` 的 `counted_round` 为 `true`。
 
-两个硬保证：**工具不把异常抛给主模型**（内部异常转成 `status="failed"` 的结构化返回），
-**返回体不含 API Key**（需要提及时只显示前 4 位 + `***`）。
+工具会把普通内部异常转成 `status="failed"` 的结构化返回。特定上游错误路径会对配置的密钥脱敏，但图片引用、问题、线索和成功回答不经过普遍脱敏；不要将返回体视为无敏感信息。
 
 ---
 
@@ -167,7 +165,7 @@ image_search(
 
 ⚠️ engine 源只吃**图片公网 URL**：必须打开 `image_url.enabled`，否则所有 engine 源
 会被逐条跳过（`attempts` 记 `skipped` / `no_public_url`）。纯 `engine` 请求在
-**没有任何实际尝试**时归 `status="empty_pool"`（不是 `failed`），`hint` 会提示你打开图床。
+全部图片的候选均因缺少公网 URL 被跳过时，整单可归 `status="empty_pool"`；多图混合读取失败或预算耗尽等情况时可能返回其他状态。
 
 ### 5.4 `search` 小节
 
@@ -175,7 +173,7 @@ image_search(
 |---|---|---|
 | `max_rounds` | `2` | 每图轮数上限（0~10）。只有明确 `miss` 计轮 |
 | `source_timeout_sec` | `30` | 单源默认超时（5~300），被源自身 `timeout_sec` 覆盖 |
-| `total_timeout_sec` | `180` | 单次调用总预算（30~900）；用完后停止剩余源，已有结果照常返回 |
+| `total_timeout_sec` | `180` | 单次调用的源调度预算（30~900）；发起新源前检查截止时间。已开始的源以及图片准备不按剩余预算强制截断，因此实际耗时可能超过此值 |
 | `merge_enabled` | `true` | 命中后是否继续试后续源做多源合并 |
 | `merge_max_sources` | `3` | 每图最多合并源数（1~5，含首个命中源） |
 | `cache_ttl_sec` | `300` | 结果缓存 TTL（0~3600，0=关闭） |
@@ -268,13 +266,13 @@ image_search(
 
 1. 归一化 `image_refs`（去重、≤8 张）、`question`（≤500 字）、`intent`（≤300 字）。
 2. 按 `search_type` 选候选源；`auto` 先 engine 后 vision。
-3. 每张图独立执行：读取图片 → SSRF 校验 → 体积/像素压缩 → 生成 data URI
+3. 每张图独立执行：校验远程引用及重定向目标并读取图片 → 体积/像素压缩 → 生成 data URI
    （有 engine 候选时才发布图床 URL）→ 查缓存。
 4. 按顺序尝试源；命中后视 `merge_enabled` 继续合并；明确 `miss` 计轮。
 5. 汇总为 `images[]` + 人话 `summary` + `hint` + `notes`，以 JSON 字符串返回。
 
-**缓存键**：`sha256(图片字节) + "|" + JSON([search_type, question, intent])`。
-`intent` 不同不会命中同一份缓存；缓存 TTL 内最多保留 256 条，超出淘汰最旧条目。
+**缓存键**：`sha256(预处理后的图片字节) + "|" + JSON([search_type, question, intent])`。
+`intent` 不同不会命中同一份缓存；缓存 TTL 内最多保留 256 条，超出淘汰最旧条目。查缓存之前仍会读取图片，远程图片可能产生下载请求，engine 候选还可能触发图床发布。
 
 **失败与降级**：
 
@@ -285,9 +283,9 @@ image_search(
 | 明确未命中 | 计 1 轮（受 `max_rounds` 约束） |
 | 源配置非法 | 记 `skipped` / `invalid_source`，其余源照常 |
 | 图床未开 / 发布失败 | engine 源记 `skipped` / `no_public_url`；`auto` 下 vision 照常 |
-| 没有任何实际尝试 | `status="empty_pool"`，hint 说明是缺源、缺图床还是超尺寸 |
+| 无可用源，或所有候选均被跳过 | 可能返回 `status="empty_pool"`；图片读取失败或总预算耗尽等场景可能返回其他状态 |
 | 图片读不出来 | 该图失败，其他图照常；全部不可读 → `bad_refs` |
-| 总预算耗尽 | 停止剩余源，返回已有结果，notes 追加 `total_timeout` |
+| 总预算耗尽 | 后续图或源发起前检查截止时间，发现超时才记录；已开始的操作可能继续，逐图外层超时可能丢弃该图尚未汇总的结果 |
 | 内部未预期异常 | 转成 `status="failed"`，堆栈只进日志 |
 
 ---
@@ -312,20 +310,24 @@ image_search(
 - **2.0.0**：破坏性重构，源池改为 vision + engine，唯一工具改为 `image_search`。
 - **v1.7 → v2.0 的迁移脚本只存在于 v2.0.0 的历史里**（本仓库 `23dacda` 提交）。
   需要时可在旧提交中取出 `migrate_v1_7.py`；v2.1.0 本身不再提供迁移入口。
-- **2.0.0 → 2.1.0 配置兼容**：配置键没有变化，直接替换插件目录即可；
-  已有的 v2.0.0 配置可以原样使用。
+- **2.0.0 → 2.1.0**：现有受支持的配置键没有变化，但遗留 `desc` / `description` 字段不再透传。升级前备份插件目录和配置，并确认实际安装的提交；v1.7 的旧配置应先按历史迁移文档处理。
+- **调用方兼容性**：2.1.0 在 `search_type` 之前插入了 `intent`。直接使用位置参数的旧调用可能把原来的 `search_type` 传入 `intent`；建议改用具名参数。
 
 ---
 
 ## 9. 开发与测试
 
+先在本仓库根目录设置 `PLUGIN_DIR="$PWD"`，并设置 `ASTRBOT_DIR` 指向 AstrBot 安装目录、`PYTHON` 指向已安装测试依赖的 Python 解释器。使用独立临时工作目录，避免 AstrBot 导入时在仓库目录生成运行数据：
+
 ```bash
-cd /root/workspace/projects/astrbot_plugin_image_search
-PYTHONDONTWRITEBYTECODE=1 \
-PYTEST_ADDOPTS='-p no:cacheprovider' \
-PYTHONPATH=/root/AstrBot \
-/root/AstrBot/.venv/bin/python -m pytest tests/ -q
+PLUGIN_DIR="$PWD"
+# 示例：ASTRBOT_DIR=/path/to/AstrBot；PYTHON="$ASTRBOT_DIR/.venv/bin/python"
+TEST_CWD=$(mktemp -d)
+(cd "$TEST_CWD" && PYTHONDONTWRITEBYTECODE=1 PYTEST_ADDOPTS='-p no:cacheprovider' \
+  PYTHONPATH="$ASTRBOT_DIR" "$PYTHON" -m pytest "$PLUGIN_DIR/tests/" -q)
 ```
+
+测试完成后检查临时目录内容，再按本地隐私和清理规范处理该目录。
 
 | 文件 | 作用 |
 |---|---|
@@ -338,7 +340,7 @@ PYTHONPATH=/root/AstrBot \
 | `prompts.py` | vision 系统/用户提示词（含 `intent` 段落） |
 | `_conf_schema.json` | 配置 schema（WebUI 表单来源） |
 | `PRD.md` | 当前版本的接口与行为契约 |
-| `tests/` | 离线单测（网络态用例不可达时显式 skip） |
+| `tests/` | 单元测试与网络态契约用例；可用 `-k 'not test_live_'` 排除网络用例 |
 
 ---
 
@@ -352,6 +354,15 @@ PYTHONPATH=/root/AstrBot \
 
 ---
 
-## 11. License
+## 11. 隐私与网络
+
+- vision 源会将图片、问题和可选检索线索发送到所配置的模型端点；engine 源会把图片 URL 发送给图搜图服务。请仅向可信服务提供可分享的内容。
+- 启用内置图床后，图片会写入配置目录；服务监听所有 IPv4 地址，知道 URL 且网络可达的访问者可无需鉴权读取。代码中未发现已发布图片的自动清理机制；缓存 TTL 不等于图片保存期限。请自行控制网络暴露面，并根据部署策略清理文件。
+- 本地图片引用按 AstrBot 进程的文件读取权限访问，所检查的读取路径没有目录白名单。只使用可信图片路径，并限制进程对本地文件的读取权限。
+- 返回结果会回显问题、线索及截断的图片引用，可能包含敏感 URL 或上游回答；AstrBot 的日志配置可能记录工具结果。分享日志或结果前请检查并脱敏。
+
+---
+
+## 12. License
 
 MIT © cmdst。见 [LICENSE](LICENSE)。
