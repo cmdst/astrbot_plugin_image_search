@@ -43,7 +43,7 @@
           "api_key": {
             "type": "string",
             "description": "自定义端点密钥（api_key）",
-            "hint": "以 `Authorization: Bearer <key>` 发送。留空则不下发 Authorization 头（本机反代常见）。⚠️ 日志与工具返回**绝不出现明文 key**（只可能显示前 4 位 + `***`）。",
+            "hint": "以 `Authorization: Bearer <key>` 发送。留空则不下发 Authorization 头（本机反代常见）。⚠️ 特定上游错误路径会脱敏配置密钥，但日志和工具返回可能包含用户输入、图片引用或上游回答，不能保证不含敏感信息；分享前请检查脱敏。",
             "default": ""
           },
           "model": {
@@ -79,14 +79,14 @@
           "extra_headers": {
             "type": "dict",
             "description": "附加请求头（extra_headers）",
-            "hint": "自由映射（JSON 对象），用于反代鉴权（如 `{\"api-key\": \"xxx\"}`、`{\"X-Auth\": \"yyy\"}`）或需要特殊头才放行的网关。留空 `{}` 表示不加任何额外头。⚠️ 这里写的值同样不会被日志/返回值回显。⚠️ 类型必须是 `dict` 而非 `object`：面板校验对 `object` 会强制取 `items` 子模式，缺 `items` 会抛 KeyError 导致保存配置失败；`dict` 才是 AstrBot 的自由映射类型，用户自加的键会被当数据保留。",
+            "hint": "自由映射（JSON 对象），用于反代鉴权（如 `{\"api-key\": \"xxx\"}`、`{\"X-Auth\": \"yyy\"}`）或需要特殊头才放行的网关。留空 `{}` 表示不加任何额外头。⚠️ 请求头可能包含凭据；不要假定所有日志或工具返回均已脱敏，分享前请检查。⚠️ 类型必须是 `dict` 而非 `object`：面板校验对 `object` 会强制取 `items` 子模式，缺 `items` 会抛 KeyError 导致保存配置失败；`dict` 才是 AstrBot 的自由映射类型，用户自加的键会被当数据保留。",
             "default": {}
           }
         }
       },
       "engine": {
         "name": "图搜图引擎（engine）",
-        "hint": "B 类源：拿图片的**公网 URL** 去图搜图站点反查，返回结构化命中（相似度 + 作品名 + 链接）。⚠️ 必须先在插件配置里打开 `image_url.enabled`（内置只读图床），否则引擎源全部跳过、纯 engine 请求会直接 failed。⚠️ 本环境实测：saucenao.com 与 ascii2d.net 均返回 **403 + Cloudflare「Just a moment...」人机校验页**（插件会识别为 challenge 并切下一源，**不会**从挑战页里抠标题当结果）；trace.moe 网络可达但只认动画帧，传非动画图会返回 `{\"error\": ...}`。想真跑通 SauceNAO/ascii2d，需要自建反代（填 base_url）或给 SauceNAO 配 api_key。",
+        "hint": "B 类源：拿图片的**公网 URL** 去图搜图站点反查，返回结构化命中（相似度 + 作品名 + 链接）。⚠️ 必须先打开 `image_url.enabled`（内置只读图床），否则引擎源因缺少公网 URL 而跳过；纯 engine 请求在所有图片均无实际尝试时可能返回 empty_pool，混合图片读取失败或超时可能返回其他状态。⚠️ 本环境实测：saucenao.com 与 ascii2d.net 均返回 **403 + Cloudflare「Just a moment...」人机校验页**（插件会识别为 challenge 并切下一源，**不会**从挑战页里抠标题当结果）；trace.moe 网络可达但只认动画帧，传非动画图会返回 `{\"error\": ...}`。想真跑通 SauceNAO/ascii2d，需要自建反代（填 base_url）或给 SauceNAO 配 api_key。",
         "items": {
           "enabled": {
             "type": "bool",
@@ -166,7 +166,7 @@
       "total_timeout_sec": {
         "type": "int",
         "description": "单次调用总预算（秒）",
-        "hint": "范围 30~900，默认 180。整张图（含换源与合并）共用这个预算；用完后停止尝试剩余源，**已拿到的命中照常返回**，并在返回体 notes 里追加 `total_timeout`。多源池 + 慢网络时建议抬高，否则会出现「明明有源可用却只剩一半结果」。",
+        "hint": "范围 30~900，默认 180。调用中的图片和源共用调度截止时间；发起后续图片或源前检查，发现超时才记录 `total_timeout`。已启动的源及图片准备不按剩余预算强制截断，实际耗时可能超出；逐图外层超时可能丢弃该图尚未汇总的结果。",
         "default": 180
       },
       "merge_enabled": {
@@ -184,7 +184,7 @@
       "cache_ttl_sec": {
         "type": "int",
         "description": "结果缓存 TTL（秒，0=关闭）",
-        "hint": "范围 0~3600，默认 300。缓存键 = `sha256(图片字节) + search_type + question`；命中缓存直接返回（`cached=true`）且**零网络请求**。0 = 关闭缓存。⚠️ 缓存写入图片字节哈希，同一张图换个问法（question 不同）不会命中。",
+        "hint": "范围 0~3600，默认 300。缓存键包含预处理后的图片字节哈希、search_type、question 和 intent；命中后该图不再调用搜图源（`cached=true`）。查缓存前仍会读取图片，远程引用可能下载；有 engine 候选时还可能发布图床文件。0 = 关闭缓存。",
         "default": 300
       },
       "health_stats": {
@@ -216,7 +216,7 @@
       "enabled": {
         "type": "bool",
         "description": "启用内置图床（enabled）",
-        "hint": "true = 插件加载时启动图床，把待搜图片落到本地目录并生成公网可访问 URL，engine 源才有的可查；false = engine 源全部被跳过（attempts 记 skipped / no_public_url），只留 vision 源工作。⚠️ 必须保证听得到公网地址（云主机安全组/防火墙放行端口、或对外已有反代），否则 SauceNAO 那边拉不到图，会得到「Failed to fetch image」类错误。",
+        "hint": "true = 插件加载时启动内置图床，按需将图片落盘并生成供 engine 使用的 URL；false = engine 源因缺公网 URL 被跳过，vision 源不依赖图床。⚠️ 服务监听所有 IPv4 地址，知道 URL 且网络可达者无需鉴权即可读取；已发布图片未见自动清理。仅在需要时启用并控制网络暴露面；外部引擎能否访问还取决于网络配置。",
         "default": false
       },
       "dir": {
@@ -242,7 +242,7 @@
   "download_timeout_sec": {
     "type": "int",
     "description": "远程图片下载超时（秒）",
-    "hint": "范围 5~120，默认 20。只作用于引用本身是 `http(s)` 链接的图片；本地路径 / data URI / base64 不涉及下载。下载超时、非 200、或内容不是图片（魔数嗅探失败）→ 该图 ok=false、error=`download_failed`，不影响其他图。⚠️ 内网/环回/保留网段地址会被 SSRF 防护直接拒绝（error=`ssrf_blocked`），这是刻意行为，不是 bug。",
+    "hint": "范围 5~120，默认 20。只作用于引用本身是 `http(s)` 链接的图片；本地路径 / data URI / base64 不涉及下载。下载超时、非 200、或内容不是图片（魔数嗅探失败）→ 该图 ok=false、error=`download_failed`，不影响其他图。⚠️ 代码会校验解析结果并拒绝部分内网、环回和保留地址，但校验与连接独立解析，不能视为完整网络隔离；请勿使用不可信图片 URL。",
     "default": 20
   },
   "tool_hint_enabled": {
@@ -254,7 +254,7 @@
   "log_level": {
     "type": "string",
     "description": "插件日志级别（log_level）",
-    "hint": "`debug` 会打印逐源尝试明细（含被跳过的源与原因，排障首选）、`info` 只打关键节点、`warning` 只看异常、`error` 最安静。枚举外的值回落 `info` 并告警。日志一律英文（仓库规范）。⚠️ 日志与工具返回都不会输出明文 API Key。",
+    "hint": "`debug` 会打印逐源尝试明细（含被跳过的源与原因，排障首选）、`info` 只打关键节点、`warning` 只看异常、`error` 最安静。枚举外的值回落 `info` 并告警。日志一律英文（仓库规范）。⚠️ 工具返回和日志可能包含图片引用、用户输入或上游回答；不能保证所有敏感信息均已脱敏。",
     "default": "info",
     "options": [
       "debug",
